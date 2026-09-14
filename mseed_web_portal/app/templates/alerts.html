@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-end mb-4">
+  <div>
+    <div class="portal-pill mb-2">Alerts</div>
+    <h1 class="h3 fw-bold mb-1">告警中心</h1>
+    <p class="text-secondary mb-0">设备离线、通道缺失和数据断流会在这里汇总。后台检查默认每分钟运行一次。</p>
+  </div>
+  <form method="post" action="/alerts/check-now" class="m-0">
+    <button class="btn btn-primary">立即检查</button>
+  </form>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-3"><div class="metric-card"><span>Open alerts</span><strong>{{ counts.open }}</strong></div></div>
+  <div class="col-md-3"><div class="metric-card"><span>Critical</span><strong>{{ counts.critical }}</strong></div></div>
+  <div class="col-md-3"><div class="metric-card"><span>Warning</span><strong>{{ counts.warning }}</strong></div></div>
+  <div class="col-md-3"><div class="metric-card"><span>Resolved</span><strong>{{ counts.resolved }}</strong></div></div>
+</div>
+
+<div class="portal-card">
+  {% if not alerts %}
+  <div class="empty-state">当前没有告警。</div>
+  {% endif %}
+  <div class="table-responsive">
+    <table class="table table-dark table-hover align-middle mb-0">
+      <thead><tr><th>Status</th><th>Severity</th><th>Device</th><th>Component</th><th>Type</th><th>Message</th><th>Last seen</th><th>Action</th></tr></thead>
+      <tbody>
+      {% for a in alerts %}
+      <tr>
+        <td><span class="badge {{ 'bg-danger' if a.status == 'open' else 'bg-secondary' }}">{{ a.status }}</span></td>
+        <td><span class="badge {{ 'bg-danger' if a.severity == 'critical' else 'bg-warning text-dark' }}">{{ a.severity }}</span></td>
+        <td>{{ a.device_key or '-' }}</td>
+        <td>{{ a.component or '-' }}</td>
+        <td>{{ a.alert_type }}</td>
+        <td><strong>{{ a.title }}</strong><br><span class="text-secondary small">{{ a.message }}</span></td>
+        <td><span class="unix-time" data-unix="{{ a.last_seen }}">-</span></td>
+        <td>
+          {% if a.status == 'open' %}
+          <form method="post" action="/alerts/{{ a.id }}/ack" class="m-0"><button class="btn btn-sm btn-outline-light">确认</button></form>
+          {% else %}-{% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+<script src="/static/js/time.js"></script>
+{% endblock %}

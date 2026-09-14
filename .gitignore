@@ -1,0 +1,43 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+ENV/
+.pytest_cache/
+.mypy_cache/
+
+# Runtime state and databases
+*.h5
+*.hdf5
+*.db
+*.sqlite
+*.sqlite3
+*.db-*
+*.sqlite-*
+runtime-state.tar.gz
+state/
+data/
+logs/
+
+# Historical local backups
+*.bak
+*.bak_*
+*.pre_realtime_*
+*.orig
+
+# Secrets and machine-local configuration
+.env
+.env.*
+*.pem
+*.key
+secrets.ini
+config/local*
+
+# Packaging and OS files
+*.tar.gz
+*.zip
+*.sha256
+*.pyc
+.DS_Store
+

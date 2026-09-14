@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-end mb-4">
+  <div>
+    <div class="portal-pill mb-2">System</div>
+    <h1 class="h3 fw-bold mb-1">系统状态</h1>
+    <p class="text-secondary mb-0">仅管理员可见，用于检查服务、磁盘、备份和数据库体积。</p>
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  {% for name, status in info.services.items() %}
+  <div class="col-md-3"><div class="metric-card"><span>{{ name }}</span><strong>{{ status }}</strong></div></div>
+  {% endfor %}
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-4"><div class="metric-card"><span>Disk used</span><strong>{{ '%.1f'|format(info.disk.percent) }}%</strong></div></div>
+  <div class="col-md-4"><div class="metric-card"><span>Disk free</span><strong>{{ (info.disk.free / 1024 / 1024 / 1024)|round(1) }} GB</strong></div></div>
+  <div class="col-md-4"><div class="metric-card"><span>Receiver DB size</span><strong>{{ (info.sizes.receiver_db_dir / 1024 / 1024)|round(1) }} MB</strong></div></div>
+</div>
+
+<div class="portal-card">
+  <h2 class="h5 mb-3">Recent backups</h2>
+  {% if not info.backup_runs %}<div class="empty-state">暂无备份记录。</div>{% endif %}
+  <div class="table-responsive">
+    <table class="table table-dark table-hover align-middle mb-0">
+      <thead><tr><th>Started</th><th>Status</th><th>Files</th><th>Size</th><th>Message</th></tr></thead>
+      <tbody>
+      {% for r in info.backup_runs %}
+      <tr>
+        <td><span class="unix-time" data-unix="{{ r.started_at }}">-</span></td>
+        <td>{{ r.status }}</td>
+        <td>{{ r.files_count }}</td>
+        <td>{{ (r.total_bytes / 1024 / 1024)|round(1) }} MB</td>
+        <td>{{ r.message }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+<script src="/static/js/time.js"></script>
+{% endblock %}

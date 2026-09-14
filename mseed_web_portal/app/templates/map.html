@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="h3 fw-bold">台站地图</h1>
+<p class="text-secondary">仅显示当前账号有权限访问的仪器。标记为“测试坐标”的位置由设备键确定性生成。</p>
+<img class="img-fluid border rounded bg-light" src="/api/station-map.png" alt="Station map">
+<div class="mt-3 small text-secondary">{% for p in points %}{{ p.label }}: {{ '测试坐标' if p.synthetic else '实际坐标' }} ({{ '%.4f'|format(p.latitude) }}, {{ '%.4f'|format(p.longitude) }}){% if not loop.last %} · {% endif %}{% endfor %}</div>
+{% endblock %}
