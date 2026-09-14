@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="h3 fw-bold">台站地图</h1>
+<p class="text-secondary">仅显示当前账号有权限访问的仪器。标记为“测试坐标”的位置由设备键确定性生成。</p>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+<style>.station-map { height: min(68vh, 680px); min-height: 420px; border: 1px solid rgba(148,163,184,.35); border-radius: 8px; overflow: hidden; background: #dbeafe; } .station-map .leaflet-tile { image-rendering: auto; } .station-label { font-weight: 700; color: #111827; background: rgba(255,255,255,.9); border: 1px solid rgba(15,23,42,.25); box-shadow: 0 1px 3px rgba(0,0,0,.25); padding: 2px 5px; } .station-map-fallback[hidden] { display: none; }</style>
+<div id="stationMap" class="station-map" role="region" aria-label="Station locations"></div>
+<div id="stationMapFallback" class="station-map-fallback" hidden><img class="img-fluid border rounded bg-light" src="/api/station-map.png" alt="Station map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+(function () {
+  var points = {{ points | tojson }};
+  var fallback = document.getElementById("stationMapFallback");
+  if (!window.L || !points.length) { if (fallback) fallback.hidden = false; return; }
+  var map = L.map("stationMap", { scrollWheelZoom: true });
+  L.tileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}", { maxZoom: 19, attribution: "&copy; Esri, HERE, Garmin, (c) OpenStreetMap contributors, and the GIS User Community" }).addTo(map);
+  var bounds = [];
+  points.forEach(function (p) {
+    var marker = L.circleMarker([p.latitude, p.longitude], { radius: 8, color: "#fff", weight: 2, fillColor: "#dc3545", fillOpacity: 0.95 });
+    marker.bindTooltip(p.label, { permanent: true, direction: "right", offset: [9, 0], className: "station-label" });
+    marker.bindPopup("<strong>" + String(p.label).replace(/[&<>]/g, function (c) { return {"&":"&amp;","<":"&lt;",">":"&gt;"}[c]; }) + "</strong><br>" + Number(p.latitude).toFixed(4) + ", " + Number(p.longitude).toFixed(4));
+    marker.addTo(map); bounds.push([p.latitude, p.longitude]);
+  });
+  map.fitBounds(bounds, { padding: [35, 35], maxZoom: 10 });
+  map.on("tileerror", function () { if (fallback) fallback.hidden = false; });
+})();
+</script>
+<div class="mt-3 small text-secondary">{% for p in points %}{{ p.label }}: {{ '测试坐标' if p.synthetic else '实际坐标' }} ({{ '%.4f'|format(p.latitude) }}, {{ '%.4f'|format(p.longitude) }}){% if not loop.last %} · {% endif %}{% endfor %}</div>
+{% endblock %}

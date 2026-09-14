@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-end mb-4 flex-wrap gap-3">
+  <div>
+    <div class="portal-pill mb-2">Historical waveform</div>
+    <h1 class="h3 fw-bold mb-1">历史波形查询</h1>
+    <p class="text-secondary mb-0">按设备、UTC 时间范围检索过往 miniSEED 数据；BHZ / BHN / BHE 可同时显示。</p>
+  </div>
+</div>
+
+<div class="control-panel mb-4">
+  <div class="row g-3 align-items-end">
+    <div class="col-12 col-lg-3">
+      <label class="form-label">设备</label>
+      <select id="deviceSelect" class="form-select">
+        {% for d in devices %}
+        <option value="{{ d.id }}" {% if selected_device_id and selected_device_id == d.id %}selected{% endif %}>{{ d.label }} / {{ d.device_key }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-12 col-lg-3">
+      <label class="form-label">开始时间 UTC</label>
+      <input id="startInput" class="form-control" placeholder="2026-06-30T15:30:00Z">
+    </div>
+    <div class="col-12 col-lg-3">
+      <label class="form-label">结束时间 UTC</label>
+      <input id="endInput" class="form-control" placeholder="2026-06-30T15:35:00Z">
+    </div>
+    <div class="col-12 col-lg-3">
+      <label class="form-label">分量（三分量可同时选择）</label>
+      <div id="historyComponentChecks" class="component-checks"></div>
+    </div>
+    <div class="col-12 d-flex gap-2 flex-wrap align-items-center">
+      <button id="queryBtn" type="button" class="btn btn-primary">查询</button>
+      <button id="latestBtn" type="button" class="btn btn-sm btn-outline-light">跳到最近</button>
+      <button id="prevBtn" type="button" class="btn btn-sm btn-outline-light">前移一屏</button>
+      <button id="nextBtn" type="button" class="btn btn-sm btn-outline-light">后移一屏</button>
+      <span class="small text-secondary">默认加载最近 30 分钟，主图显示最后 5 分钟；图下方小窗口可拖拽浏览已加载时间段。</span>
+    </div>
+  </div>
+</div>
+
+<div class="chart-card">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <div>
+      <h2 class="h6 fw-bold mb-0">三分量历史波形</h2>
+      <div id="historyMeta" class="small text-secondary">请选择时间范围。</div>
+    </div>
+  </div>
+  <div id="historyChart" class="waveform-chart"></div>
+</div>
+<script src="/static/js/waveform.js?v=multichannel-history-2"></script>
+<script>window.portalMode = "history";</script>
+{% endblock %}

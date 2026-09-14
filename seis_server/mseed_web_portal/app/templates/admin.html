@@ -1,0 +1,193 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-end mb-4 flex-wrap gap-3">
+  <div>
+    <div class="portal-pill mb-2">Admin</div>
+    <h1 class="h3 fw-bold mb-1">账号、客户与设备权限</h1>
+    <p class="text-secondary mb-0">同步接收端数据库，创建客户账号，维护客户分组、设备别名和设备权限。</p>
+  </div>
+  <form method="post" action="/admin/sync-devices"><button class="btn btn-primary">同步设备</button></form>
+</div>
+
+<div class="row g-4">
+  <div class="col-12 col-xl-4">
+    <div class="device-card mb-4">
+      <h2 class="h6 fw-bold mb-3">创建 / 更新用户</h2>
+      <form method="post" action="/admin/users">
+        <label class="form-label">账号</label><input class="form-control mb-3" name="username" required>
+        <label class="form-label">显示名称</label><input class="form-control mb-3" name="display_name">
+        <label class="form-label">密码</label><input class="form-control mb-3" type="password" name="password" required>
+        <label class="form-label">角色</label><select class="form-select mb-3" name="role"><option value="user">user</option><option value="admin">admin</option></select>
+        <button class="btn btn-primary w-100">保存用户</button>
+      </form>
+    </div>
+    <div class="device-card">
+      <h2 class="h6 fw-bold mb-3">创建 / 更新客户分组</h2>
+      <form method="post" action="/admin/customers">
+        <label class="form-label">客户名称</label><input class="form-control mb-3" name="name" required>
+        <label class="form-label">客户代码</label><input class="form-control mb-3" name="code" placeholder="ACME / TUM / DEMO">
+        <label class="form-label">联系人</label><input class="form-control mb-3" name="contact">
+        <label class="form-label">备注</label><input class="form-control mb-3" name="notes">
+        <button class="btn btn-primary w-100">保存客户</button>
+      </form>
+    </div>
+
+    <!-- BULK_CUSTOMER_DEVICE_RULES_ADMIN_HTML -->
+    <div class="device-card mt-4">
+      <h2 class="h6 fw-bold mb-3">批量客户设备规则</h2>
+      <p class="text-secondary small mb-3">例如 SS 01000–02000：当范围内的新设备被识别后，会自动归入所选客户；该客户下的用户会自动看到这些设备。</p>
+      <form method="post" action="/admin/access-rules" class="row g-2 align-items-end mb-3">
+        <div class="col-12">
+          <label class="form-label">客户</label>
+          <select class="form-select form-select-sm" name="customer_id" required>
+            {% for c in customers|default([]) %}<option value="{{ c.id }}">{{ c.name }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="col-4">
+          <label class="form-label">类型</label>
+          <input class="form-control form-control-sm" name="instrument_type" value="SS" placeholder="SS / QS" required>
+        </div>
+        <div class="col-4">
+          <label class="form-label">起始序号</label>
+          <input class="form-control form-control-sm" name="serial_start" placeholder="01000" required>
+        </div>
+        <div class="col-4">
+          <label class="form-label">结束序号</label>
+          <input class="form-control form-control-sm" name="serial_end" placeholder="02000" required>
+        </div>
+        <div class="col-6">
+          <label class="form-label">Key 前缀</label>
+          <input class="form-control form-control-sm" name="device_key_prefix" placeholder="SS_">
+        </div>
+        <div class="col-6">
+          <label class="form-label">备注</label>
+          <input class="form-control form-control-sm" name="notes" placeholder="SS_01000-02000 for customer A">
+        </div>
+        <div class="col-12"><button class="btn btn-sm btn-primary w-100">保存并应用规则</button></div>
+      </form>
+
+      <div class="table-responsive">
+        <table class="table table-dark table-sm align-middle">
+          <thead><tr><th>客户</th><th>范围</th><th>前缀</th><th>备注</th><th>操作</th></tr></thead>
+          <tbody>
+          {% for r in access_rules|default([]) %}
+          <tr>
+            <td>{{ r.customer_name }}</td>
+            <td>{{ r.instrument_type }}_{{ "%05d"|format(r.serial_start) }}–{{ "%05d"|format(r.serial_end) }}</td>
+            <td>{{ r.device_key_prefix or '' }}</td>
+            <td class="text-secondary small">{{ r.notes or '' }}</td>
+            <td>
+              <form method="post" action="/admin/access-rules/delete" onsubmit="return confirm('Delete this rule?')">
+                <input type="hidden" name="rule_id" value="{{ r.id }}">
+                <button class="btn btn-sm btn-outline-danger">删除</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if not access_rules %}<tr><td colspan="5" class="text-secondary">暂无批量规则。</td></tr>{% endif %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+  </div>
+
+  <div class="col-12 col-xl-8">
+    <div class="device-card mb-4">
+      <h2 class="h6 fw-bold mb-3">设备别名与客户分组</h2>
+      <div class="table-responsive">
+        <table class="table table-dark table-sm align-middle">
+          <thead><tr><th>ID</th><th>设备</th><th>别名 / 站点</th><th>客户</th><th>操作</th></tr></thead>
+          <tbody>
+          {% for d in devices %}
+          <tr>
+            <td>{{ d.id }}</td>
+            <td><div class="fw-semibold">{{ d.device_key }}</div><div class="small text-secondary">{{ d.instrument_type }} / {{ d.instrument_serial }}</div></td>
+            <td style="min-width:260px;">
+              <form method="post" action="/admin/device-metadata" class="row g-2">
+                <input type="hidden" name="device_id" value="{{ d.id }}">
+                <div class="col-12"><input class="form-control form-control-sm" name="label" value="{{ d.label }}" placeholder="显示标签"></div>
+                <div class="col-6"><input class="form-control form-control-sm" name="alias" value="{{ d.alias or '' }}" placeholder="客户可读别名"></div>
+                <div class="col-6"><input class="form-control form-control-sm" name="site_name" value="{{ d.site_name or '' }}" placeholder="站点名称"></div>
+                <div class="col-12"><input class="form-control form-control-sm" name="location_note" value="{{ d.location_note or '' }}" placeholder="安装位置说明"></div>
+                <div class="col-4"><input class="form-control form-control-sm" name="latitude" value="{{ d.latitude or '' }}" placeholder="Lat"></div>
+                <div class="col-4"><input class="form-control form-control-sm" name="longitude" value="{{ d.longitude or '' }}" placeholder="Lon"></div>
+                <div class="col-4"><input class="form-control form-control-sm" name="install_date" value="{{ d.install_date or '' }}" placeholder="安装日期"></div>
+            </td>
+            <td style="min-width:180px;">
+                <select class="form-select form-select-sm" name="customer_id">
+                  <option value="0">未分组</option>
+                  {% for c in customers|default([]) %}{% if c.code != 'UNASSIGNED' and c.name not in ['Unassigned', '未分组'] %}<option value="{{ c.id }}" {% if d.customer_id and d.customer_id == c.id %}selected{% endif %}>{{ c.name }}</option>{% endif %}{% endfor %}
+                </select>
+            </td>
+            <td><button class="btn btn-sm btn-primary">保存</button></form></td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="device-card mb-4">
+      <h2 class="h6 fw-bold mb-3">用户列表与客户归属</h2>
+      <div class="table-responsive">
+        <table class="table table-dark table-sm align-middle">
+          <thead><tr><th>ID</th><th>账号</th><th>显示名称</th><th>角色</th><th>客户分组</th></tr></thead>
+          <tbody>
+          {% for u in users %}
+          <tr>
+            <td>{{ u.id }}</td><td>{{ u.username }}</td><td>{{ u.display_name }}</td><td>{{ u.role }}</td>
+            <td>
+              <form method="post" action="/admin/user-customer" class="d-flex gap-2">
+                <input type="hidden" name="user_id" value="{{ u.id }}">
+                <select class="form-select form-select-sm" name="customer_id">
+                  <option value="0">未分组</option>
+                  {% for c in customers|default([]) %}{% if c.code != 'UNASSIGNED' and c.name not in ['Unassigned', '未分组'] %}<option value="{{ c.id }}" {% if u.customer_id and u.customer_id == c.id %}selected{% endif %}>{{ c.name }}</option>{% endif %}{% endfor %}
+                </select>
+                <button class="btn btn-sm btn-outline-light">保存</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="device-card">
+      <h2 class="h6 fw-bold mb-3">设备权限</h2>
+      <div class="table-responsive">
+        <table class="table table-dark table-sm align-middle">
+          <thead><tr><th>用户</th><th>已授权设备</th><th>授权新设备</th></tr></thead>
+          <tbody>
+          {% for u in users %}
+          <tr>
+            <td>{{ u.username }}</td>
+            <td>
+              {% for d in devices %}
+                {% if d.id in assigned[u.id] %}
+                <form method="post" action="/admin/revoke" class="d-inline">
+                  <input type="hidden" name="user_id" value="{{ u.id }}"><input type="hidden" name="device_id" value="{{ d.id }}">
+                  <button class="btn btn-sm btn-outline-light mb-1">{{ d.alias or d.label }} ×</button>
+                </form>
+                {% endif %}
+              {% endfor %}
+            </td>
+            <td>
+              <form method="post" action="/admin/grant" class="d-flex gap-2">
+                <input type="hidden" name="user_id" value="{{ u.id }}">
+                <select class="form-select form-select-sm" name="device_id">
+                  {% for d in devices %}<option value="{{ d.id }}">{{ d.alias or d.label }} / {{ d.device_key }}</option>{% endfor %}
+                </select>
+                <button class="btn btn-sm btn-primary">授权</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
