@@ -16,11 +16,20 @@ from obspy import Stream, Trace, UTCDateTime, read
 
 @contextmanager
 def open_h5_read(path: str):
-    """Open a receiver file with SWMR and short retries during writer flushes."""
+    """Open a receiver file read-only without fighting the writer's file lock.
+
+    The portal is a pure reader and never mutates the file, while the receiver
+    opens the same file in plain append mode (non-SWMR) on nearly every packet,
+    holding an HDF5/POSIX file lock. If the portal also tried to take a lock it
+    would block indefinitely (dashboard hangs) or fail and retry. We therefore
+    open with ``locking=False`` so reads proceed concurrently with the writer.
+    SWMR read is kept as the preferred mode with a short retry during writer
+    flushes; both the SWMR path and the fallback disable locking.
+    """
     last_error: OSError | None = None
     for _ in range(3):
         try:
-            f = h5py.File(path, "r", libver="latest", swmr=True)
+            f = h5py.File(path, "r", libver="latest", swmr=True, locking=False)
         except OSError as exc:
             last_error = exc
             time.sleep(0.05)
@@ -31,7 +40,7 @@ def open_h5_read(path: str):
             f.close()
         return
     try:
-        f = h5py.File(path, "r")
+        f = h5py.File(path, "r", locking=False)
     except OSError:
         if last_error is not None:
             raise last_error
@@ -40,6 +49,129 @@ def open_h5_read(path: str):
         yield f
     finally:
         f.close()
+
+# ---------- 新/旧 HDF5 布局统一访问 ----------
+# 新布局 (TCP 接收端 db.py layout=2): 每个 stream group 下有 ``index`` (结构化
+# 记录表) + ``samples`` (拼接波形) + ``raw_blob`` (拼接原始 miniSEED 字节)。
+# 旧布局: 每条记录一个 ``rec_*`` / ``gap_*`` dataset，波形即 dataset 本身，
+# 元数据在 dataset.attrs，原始字节在 attrs['raw_mseed']。
+# 升级场景: 旧 rec_* group 被接收端就地升级为 layout=2 后，同一 group 内会
+# **同时**存在历史 rec_* dataset 和新的 index，二者都必须读，否则升级前的
+# 历史数据会从查询中消失。因此所有访问都同时遍历两个来源。
+
+def _has_index(grp: "h5py.Group") -> bool:
+    return isinstance(grp, h5py.Group) and "index" in grp and isinstance(grp.get("index"), h5py.Dataset)
+
+
+def _legacy_record_datasets(grp: "h5py.Group") -> list:
+    """rec_* / gap_* 波形 dataset（排除 index/samples/raw_blob 等结构数组）。"""
+    reserved = {"index", "samples", "raw_blob"}
+    out = []
+    for name in grp.keys():
+        if name in reserved:
+            continue
+        item = grp[name]
+        if isinstance(item, h5py.Dataset) and item.attrs.get("start_unix") is not None:
+            out.append(name)
+    return out
+
+
+def _stream_is_new_layout(grp: "h5py.Group") -> bool:
+    # Retained for callers that only need a quick "has new arrays" check.
+    return _has_index(grp)
+
+
+def _stream_record_count(grp: "h5py.Group") -> int:
+    count = 0
+    if _has_index(grp):
+        count += int(grp["index"].shape[0])
+    count += len(_legacy_record_datasets(grp))
+    return count
+
+
+def _stream_last_start(grp: "h5py.Group") -> float | None:
+    last = None
+    if _has_index(grp):
+        idx = grp["index"]
+        if idx.shape[0]:
+            m = float(np.max(idx["start_unix"]))
+            last = m if last is None else max(last, m)
+    for name in _legacy_record_datasets(grp):
+        st = grp[name].attrs.get("start_unix")
+        if st is not None:
+            st = float(st)
+            last = st if last is None else max(last, st)
+    return last
+
+
+def _decode(value: Any) -> str:
+    if isinstance(value, (bytes, np.bytes_)):
+        return value.decode("utf-8", "replace").rstrip("\x00")
+    return str(value)
+
+
+def _iter_stream_records(grp: "h5py.Group", stream_key: str,
+                         start_unix: float, end_unix: float, limit_remaining: int):
+    """Yield ``(waveform_or_None, raw_bytes_or_None, meta)`` per overlapping record.
+
+    Reads BOTH the rolling ``index`` layout and any legacy ``rec_*`` datasets in
+    the same group so upgraded (mixed) files return their full history.  ``meta``
+    carries start_unix/end_unix/sampling_rate and n/s/l/c so callers can build
+    obspy Traces identically.
+    """
+    parts = stream_key.split(".")
+    net = parts[0] if len(parts) > 0 else ""
+    sta = parts[1] if len(parts) > 1 else ""
+    loc = parts[2] if len(parts) > 2 else ""
+    cha = parts[3] if len(parts) > 3 else (parts[-1] if parts else "")
+
+    emitted = 0
+
+    # --- source 1: rolling index ---
+    if _has_index(grp) and emitted < limit_remaining:
+        index = grp["index"][:]
+        if index.shape[0]:
+            order = np.argsort(index["start_unix"], kind="stable")
+            samples = grp["samples"]
+            raw_blob = grp["raw_blob"]
+            for i in order:
+                if emitted >= limit_remaining:
+                    break
+                row = index[i]
+                s = float(row["start_unix"]); e = float(row["end_unix"])
+                if e != -1.0 and (e < start_unix or s > end_unix):
+                    continue
+                meta = {"start_unix": s, "end_unix": e,
+                        "sampling_rate": float(row["sampling_rate"]),
+                        "network": net, "station": sta, "location": loc, "channel": cha}
+                raw = None
+                if int(row["raw_len"]) > 0:
+                    off = int(row["raw_offset"]); ln = int(row["raw_len"])
+                    raw = raw_blob[off:off + ln].tobytes()
+                off = int(row["sample_offset"]); npts = int(row["npts"])
+                wf = samples[off:off + npts] if npts > 0 else np.empty(0)
+                yield wf, raw, meta
+                emitted += 1
+
+    # --- source 2: legacy rec_* datasets ---
+    for ds_name in sorted(_legacy_record_datasets(grp)):
+        if emitted >= limit_remaining:
+            break
+        dset = grp[ds_name]
+        s = float(dset.attrs.get("start_unix"))
+        e = float(dset.attrs.get("end_unix", -1.0))
+        if e != -1.0 and (e < start_unix or s > end_unix):
+            continue
+        meta = {"start_unix": s, "end_unix": e,
+                "sampling_rate": float(dset.attrs.get("sampling_rate", 1.0) or 1.0),
+                "network": _decode(dset.attrs.get("network", "")),
+                "station": _decode(dset.attrs.get("station", "")),
+                "location": _decode(dset.attrs.get("location", "")),
+                "channel": _decode(dset.attrs.get("channel", ""))}
+        raw_attr = dset.attrs.get("raw_mseed")
+        raw = bytes(raw_attr) if raw_attr is not None else None
+        yield dset[()], raw, meta
+        emitted += 1
 
 # ---------- 通用类与工具 ----------
 class DiscoveredDevice:
@@ -316,48 +448,105 @@ def list_components(db_path: str, device_key: str | None = None) -> list[dict[st
                 continue
             parts = stream_key.split(".")
             component = parts[-1] if len(parts) >= 4 else stream_key
-            datasets = [item for item in grp.values() if isinstance(item, h5py.Dataset)]
-            count = len(datasets)
-            last_start = None
-            for dset in datasets:
-                st = dset.attrs.get("start_unix")
-                if st is not None and (last_start is None or st > last_start):
-                    last_start = float(st)
             components.append({
                 "component": component,
                 "stream_key": stream_key,
-                "packets": count,
-                "last_start": last_start,
+                "packets": _stream_record_count(grp),
+                "last_start": _stream_last_start(grp),
             })
     return sorted(components, key=lambda item: (str(item["component"]), str(item["stream_key"])))
 
 
-def device_summary(db_path: str, device_key: str | None = None) -> dict[str, Any]:
-    if is_obn_h5(db_path):
-        return device_summary_obn(db_path)
+def _is_obn_handle(f: h5py.File) -> bool:
+    """OBN detection on an already-open handle (no extra file open)."""
+    return "samples" in f and "packet_time_us" in f
 
-    comps = list_components(db_path, device_key)
-    total_packets = sum(int(c.get("packets") or 0) for c in comps)
-    last_start = max((float(c["last_start"]) for c in comps if c.get("last_start") is not None), default=None)
-    now = time.time()
-    age_seconds = now - last_start if last_start is not None else None
-    status = "online" if age_seconds and age_seconds <= 600 else ("stale" if age_seconds and age_seconds <= 3600 else "offline")
-    component_status = []
-    for comp in comps:
-        comp_last = comp.get("last_start")
-        comp_age = now - float(comp_last) if comp_last is not None else None
-        component_status.append({**comp, "age_seconds": comp_age,
-            "status": "online" if comp_age is not None and comp_age <= 600 else ("stale" if comp_age is not None and comp_age <= 3600 else "offline")})
-    quality = quality_summary(db_path, device_key, limit=1)
-    one_hour_start = now - 3600
-    one_hour_packets = 0
+
+def _components_from_handle(f: h5py.File) -> list[dict[str, Any]]:
+    """MiniSEED component listing from an already-open handle."""
+    components: list[dict[str, Any]] = []
+    for stream_key in f.keys():
+        grp = f[stream_key]
+        if not isinstance(grp, h5py.Group):
+            continue
+        parts = stream_key.split(".")
+        component = parts[-1] if len(parts) >= 4 else stream_key
+        components.append({
+            "component": component,
+            "stream_key": stream_key,
+            "packets": _stream_record_count(grp),
+            "last_start": _stream_last_start(grp),
+        })
+    return sorted(components, key=lambda item: (str(item["component"]), str(item["stream_key"])))
+
+
+def _quality_counts_from_handle(f: h5py.File, limit: int = 1) -> dict[str, int]:
+    """Gap/duplicate/bad-packet counts from an already-open handle."""
+    gap_count = 0
+    duplicate_count = 0
+    bad_packet_count = 0
+    if "gaps" in f:
+        ds = f["gaps"]
+        gap_count = min(len(ds), limit)
+    if "events" in f:
+        ds = f["events"]
+        for row in ds[max(0, len(ds) - limit):]:
+            event_type = row["event_type"]
+            if isinstance(event_type, bytes):
+                event_type = event_type.decode("utf-8", "replace").rstrip("\x00")
+            event_type = str(event_type)
+            if "duplicate" in event_type:
+                duplicate_count += 1
+            if "bad" in event_type or "validation" in event_type or "write_failed" in event_type:
+                bad_packet_count += 1
+    return {"gap_count": gap_count, "duplicate_count": duplicate_count, "bad_packet_count": bad_packet_count}
+
+
+def device_summary(db_path: str, device_key: str | None = None) -> dict[str, Any]:
+    # Open the device file exactly once. Previously this path opened the same
+    # HDF5 file ~5 times per device (is_obn_h5 + list_components[+is_obn_h5] +
+    # quality_summary + one_hour_packets), which serialized lock contention with
+    # the receiver's writer and made the dashboard hang. Everything below now
+    # reuses a single handle.
     with open_h5_read(db_path) as f:
+        if _is_obn_handle(f):
+            # OBN summary is cheap and self-contained; defer to its helper which
+            # reopens the file, but OBN files are rare and not the hang source.
+            return device_summary_obn(db_path)
+
+        comps = _components_from_handle(f)
+        now = time.time()
+        total_packets = sum(int(c.get("packets") or 0) for c in comps)
+        last_start = max(
+            (float(c["last_start"]) for c in comps if c.get("last_start") is not None),
+            default=None,
+        )
+        age_seconds = now - last_start if last_start is not None else None
+        status = "online" if age_seconds and age_seconds <= 600 else ("stale" if age_seconds and age_seconds <= 3600 else "offline")
+
+        component_status = []
+        for comp in comps:
+            comp_last = comp.get("last_start")
+            comp_age = now - float(comp_last) if comp_last is not None else None
+            component_status.append({**comp, "age_seconds": comp_age,
+                "status": "online" if comp_age is not None and comp_age <= 600 else ("stale" if comp_age is not None and comp_age <= 3600 else "offline")})
+
+        quality = _quality_counts_from_handle(f, limit=1)
+
+        one_hour_start = now - 3600
+        one_hour_packets = 0
         for grp in f.values():
             if not isinstance(grp, h5py.Group):
                 continue
-            for dset in grp.values():
-                if isinstance(dset, h5py.Dataset) and float(dset.attrs.get("recv_unix", 0.0)) >= one_hour_start:
+            if _has_index(grp):
+                idx = grp["index"]
+                if idx.shape[0]:
+                    recv = idx["recv_unix"][:]
+                    one_hour_packets += int(np.count_nonzero(recv >= one_hour_start))
+            for name in _legacy_record_datasets(grp):
+                if float(grp[name].attrs.get("recv_unix", 0.0)) >= one_hour_start:
                     one_hour_packets += 1
+
     return {
         "components": comps,
         "total_packets": total_packets,
@@ -416,45 +605,30 @@ def read_waveform(
                 continue
             if component and stream_key.rsplit(".", 1)[-1] != component:
                 continue
-            for ds_name in sorted(grp.keys()):
+            for wf, raw, meta in _iter_stream_records(grp, stream_key, start_unix, end_unix, max_records - packet_count):
                 if packet_count >= max_records:
                     break
-                dset = grp[ds_name]
-                if not isinstance(dset, h5py.Dataset):
-                    continue
-                dset_start = dset.attrs.get("start_unix")
-                dset_end = dset.attrs.get("end_unix", -1.0)
-                if dset_start is None:
-                    continue
-                if dset_end != -1.0 and (dset_end < start_unix or dset_start > end_unix):
-                    continue
-                raw_packet = dset.attrs.get("raw_mseed")
-                if raw_packet is not None:
-                    raw = bytes(raw_packet)
-                    if raw:
-                        try:
-                            st += read(BytesIO(raw), format="MSEED")
-                        except Exception:
-                            # Legacy or manually-created HDF5 records may carry a
-                            # non-miniSEED raw attribute; use their samples instead.
-                            pass
-                        else:
-                            packet_count += 1
-                            raw_bytes += len(raw)
-                            continue
-                data = dset[()]
-                sr = dset.attrs.get("sampling_rate", 1.0)
-                npts = len(data)
+                if raw:
+                    try:
+                        st += read(BytesIO(raw), format="MSEED")
+                    except Exception:
+                        pass
+                    else:
+                        packet_count += 1
+                        raw_bytes += len(raw)
+                        continue
+                data = np.asarray(wf)
+                sr = meta["sampling_rate"]
                 tr = Trace(data=data)
-                tr.stats.network = dset.attrs.get("network", "")
-                tr.stats.station = dset.attrs.get("station", "")
-                tr.stats.location = dset.attrs.get("location", "")
-                tr.stats.channel = dset.attrs.get("channel", "")
+                tr.stats.network = meta["network"]
+                tr.stats.station = meta["station"]
+                tr.stats.location = meta["location"]
+                tr.stats.channel = meta["channel"]
                 tr.stats.sampling_rate = sr if sr and sr > 0 else 1.0
-                tr.stats.starttime = UTCDateTime(dset_start)
+                tr.stats.starttime = UTCDateTime(meta["start_unix"])
                 st.append(tr)
                 packet_count += 1
-                raw_bytes += int(np.asarray(data).nbytes)
+                raw_bytes += int(data.nbytes)
 
     if packet_count == 0 or len(st) == 0:
         return {
@@ -569,38 +743,26 @@ def export_mseed_bytes(
                         break
                 if not comp_match:
                     continue
-            for ds_name in sorted(grp.keys()):
+            for wf, raw, meta in _iter_stream_records(grp, stream_key, start_unix, end_unix, max_records - count):
                 if count >= max_records:
                     break
-                dset = grp[ds_name]
-                if not isinstance(dset, h5py.Dataset):
-                    continue
-                dset_start = dset.attrs.get("start_unix")
-                dset_end = dset.attrs.get("end_unix", -1.0)
-                if dset_start is None:
-                    continue
-                if dset_end != -1.0 and (dset_end < start_unix or dset_start > end_unix):
-                    continue
-                raw_packet = dset.attrs.get("raw_mseed")
-                if raw_packet is not None:
-                    raw = bytes(raw_packet)
-                    if raw:
-                        try:
-                            read(BytesIO(raw), format="MSEED", headonly=True)
-                        except Exception:
-                            pass
-                        else:
-                            raw_packets.append(raw)
-                            count += 1
-                            continue
-                data = dset[()]
+                if raw:
+                    try:
+                        read(BytesIO(raw), format="MSEED", headonly=True)
+                    except Exception:
+                        pass
+                    else:
+                        raw_packets.append(raw)
+                        count += 1
+                        continue
+                data = np.asarray(wf)
                 tr = Trace(data=data)
-                tr.stats.network = dset.attrs.get("network", "")
-                tr.stats.station = dset.attrs.get("station", "")
-                tr.stats.location = dset.attrs.get("location", "")
-                tr.stats.channel = dset.attrs.get("channel", "")
-                tr.stats.sampling_rate = dset.attrs.get("sampling_rate", 1.0)
-                tr.stats.starttime = UTCDateTime(dset_start)
+                tr.stats.network = meta["network"]
+                tr.stats.station = meta["station"]
+                tr.stats.location = meta["location"]
+                tr.stats.channel = meta["channel"]
+                tr.stats.sampling_rate = meta["sampling_rate"] or 1.0
+                tr.stats.starttime = UTCDateTime(meta["start_unix"])
                 st.append(tr)
                 count += 1
 

@@ -143,16 +143,27 @@ def login_page(request: Request):
 
 @app.post("/login")
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
-    user = app_db.authenticate_user(settings.app_db, username.strip(), password)
-    if not user:
+    client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() \
+        or (request.client.host if request.client else "?")
+    uname = username.strip()
+    result = app_db.authenticate_user(settings.app_db, uname, password)
+    if not result.ok:
+        log.warning(
+            "login failed: user=%r ip=%s reason=%s",
+            uname, client_ip, result.reason,
+        )
         return templates.TemplateResponse(
-            request, 
-            "login.html", 
-            template_context(request, error="Invalid username or password."), 
+            request,
+            "login.html",
+            template_context(request, error="Invalid username or password."),
             status_code=401
         )
+    log.info(
+        "login success: user=%r id=%s role=%s ip=%s",
+        uname, result.user["id"], result.user["role"], client_ip,
+    )
     request.session.clear()
-    request.session["user_id"] = int(user["id"])
+    request.session["user_id"] = int(result.user["id"])
     return RedirectResponse(url="/dashboard", status_code=303)
 
 

@@ -42,12 +42,17 @@ class DeviceDatabaseManager:
         self._locks_guard = threading.Lock()
         self._locks: dict[Path, threading.Lock] = {}
         self._sha256_cache: dict[Path, set[str]] = {}
-        # New files remain open in SWMR write mode. This removes one HDF5
-        # open/close cycle per packet and lets the portal read flushed data
-        # while instruments continue streaming. Old HDF5 files whose
-        # superblock predates SWMR retain the previous open/write/close path.
+        # Files are opened in plain append mode per write and closed again
+        # immediately (see _open_for_write). SWMR write mode is intentionally
+        # NOT used: the receiver mutates file structure (new groups, attrs and
+        # a dataset per record) on nearly every packet, which SWMR forbids and
+        # which previously corrupted handles and left stuck consistency flags.
+        # _files stays empty under normal operation; close()/_evict_handle keep
+        # it only as a safety net for any stray cached handle.
         self._files: dict[Path, h5py.File] = {}
-        self._legacy_paths: set[Path] = set()
+        # Tracks (path, stream) pairs whose sha256 cache has been seeded from the
+        # on-disk rolling index, so we only pay that scan once per stream.
+        self._seeded: set[tuple[Path, str]] = set()
 
     def _lock_for(self, path: Path) -> threading.Lock:
         with self._locks_guard:
@@ -113,43 +118,137 @@ class DeviceDatabaseManager:
 
     def _write_zero_gap(self, grp: h5py.Group, start: float, end: float, sampling_rate: float,
                         dtype: np.dtype, options: dict[str, object], now: float, seq: int) -> int:
-        """Write one synthetic zero-valued dataset covering a time gap."""
+        """Append one synthetic zero-valued span covering a time gap.
+
+        Stored as a normal record row in the rolling ``index`` with
+        ``synthetic_zero=1`` so the reader can treat it like any other segment.
+        """
         npts = int(round((end - start) * sampling_rate))
         if npts <= 0:
             return 0
-        name = f"gap_{int(start * 1_000_000_000):019d}_{int(end * 1_000_000_000):019d}_{seq:06d}"
-        if name in grp:
-            return 0
-        dset = grp.create_dataset(name, data=np.zeros(npts, dtype=dtype), **options)
-        dset.attrs.update({"start_unix": start, "end_unix": end, "sampling_rate": sampling_rate,
-                           "npts": npts, "seq_no": -1, "synthetic_zero": 1,
-                           "gap_start_unix": start, "gap_end_unix": end, "recv_unix": now,
-                           "quality": "D"})
+        zeros = np.zeros(npts, dtype=dtype)
+        sample_offset = self._extend(grp["samples"], zeros)
+        index = grp["index"]
+        row = int(index.shape[0])
+        index.resize(row + 1, axis=0)
+        index[row] = (
+            start, end, now, -1, sampling_rate, npts,
+            sample_offset, 0, 0, 0, 0,
+            b"", b"D", 1,
+        )
         return npts
 
-    def _open_for_write(self, path: Path, device_id: str, keys: dict[str, str]) -> tuple[h5py.File, bool]:
-        """Return a writer file and whether it may remain open after a write."""
-        existing = self._files.get(path)
-        if existing is not None:
-            return existing, True
+    # Index dtype for the rolling per-stream record index.  One row per stored
+    # record.  ``sample_offset``/``npts`` point into the stream's ``samples``
+    # array; ``raw_offset``/``raw_len`` point into ``raw_blob``.  Keeping the
+    # waveform in a few big arrays (instead of one dataset per record) keeps the
+    # number of HDF5 objects ~constant, which is what makes huge files fast.
+    INDEX_DTYPE = np.dtype([
+        ("start_unix", "f8"), ("end_unix", "f8"), ("recv_unix", "f8"),
+        ("seq_no", "i8"), ("sampling_rate", "f8"), ("npts", "i8"),
+        ("sample_offset", "i8"), ("raw_offset", "i8"), ("raw_len", "i8"),
+        ("packet_len", "i8"), ("record_length", "i8"),
+        ("sha256", "S64"), ("quality", "S4"), ("synthetic_zero", "i1"),
+    ])
 
+    def _stream_options(self) -> dict[str, object]:
+        options: dict[str, object] = {"chunks": True}
+        if self.config.storage.hdf5_compression:
+            options["compression"] = self.config.storage.hdf5_compression
+            if self.config.storage.hdf5_compression == "gzip":
+                options["compression_opts"] = self.config.storage.hdf5_compression_opts
+        return options
+
+    def _ensure_stream_arrays(self, grp: h5py.Group, sample_dtype: np.dtype) -> None:
+        """Create the rolling ``samples``/``raw_blob``/``index`` arrays once.
+
+        ``grp.attrs['layout'] == 2`` marks the new rolling-array format so the
+        portal reader can distinguish it from the legacy ``rec_*``
+        one-dataset-per-record layout (both remain readable).
+        """
+        if grp.attrs.get("layout", 0) == 2 and "index" in grp:
+            return
+        opts = self._stream_options()
+        if "samples" not in grp:
+            grp.create_dataset("samples", shape=(0,), maxshape=(None,),
+                               dtype=sample_dtype, **opts)
+        if "raw_blob" not in grp:
+            grp.create_dataset("raw_blob", shape=(0,), maxshape=(None,),
+                               dtype=np.uint8, **opts)
+        if "index" not in grp:
+            grp.create_dataset("index", shape=(0,), maxshape=(None,),
+                               dtype=self.INDEX_DTYPE, chunks=True)
+        grp.attrs["layout"] = 2
+
+    @staticmethod
+    def _extend(dset: h5py.Dataset, data: np.ndarray) -> int:
+        """Append ``data`` to a 1-D extensible dataset; return the start offset."""
+        offset = int(dset.shape[0])
+        dset.resize(offset + len(data), axis=0)
+        if len(data):
+            dset[offset:] = data
+        return offset
+
+    def _append_record(self, grp: h5py.Group, waveform: np.ndarray, packet: bytes,
+                        header: MSeedHeader, seq: int, now: float,
+                        synthetic_zero: int = 0) -> None:
+        wf = np.asarray(waveform)
+        sample_offset = self._extend(grp["samples"], wf)
+        raw_arr = np.frombuffer(packet, dtype=np.uint8) if packet else np.empty(0, np.uint8)
+        raw_offset = self._extend(grp["raw_blob"], raw_arr)
+        index = grp["index"]
+        row = int(index.shape[0])
+        index.resize(row + 1, axis=0)
+        index[row] = (
+            header.start_unix,
+            header.end_unix if header.end_unix is not None else -1.0,
+            now, seq, header.sampling_rate or 0.0,
+            int(header.npts or len(wf)),
+            sample_offset, raw_offset, len(raw_arr),
+            len(packet), header.record_length,
+            header.sha256.encode("ascii", "replace")[:64],
+            (header.quality or "").encode("ascii", "replace")[:4],
+            int(synthetic_zero),
+        )
+
+    def _open_for_write(self, path: Path, device_id: str, keys: dict[str, str]) -> tuple[h5py.File, bool]:
+        """Open the device file for a single write and always close afterwards.
+
+        The receiver mutates file structure on essentially every packet: it may
+        create new stream groups, add/update group attributes and create a new
+        dataset per record. HDF5 SWMR *write* mode forbids all of these metadata
+        changes after it is enabled ("Parent entry isn't pinned or protected"),
+        which corrupts the handle, makes close() fail and leaves a stuck
+        "open for SWMR write" consistency flag on disk that blocks every later
+        open. We therefore use plain append mode and close after each write:
+        structure changes are always legal and the SWMR flag is never set.
+        Readers (the portal) open independently in SWMR-read mode.
+        """
         f = h5py.File(path, "a", libver="latest")
         self._initialize_h5(f, device_id, keys)
-        f.flush()
-        try:
-            f.swmr_mode = True
-        except RuntimeError:
-            # HDF5 cannot upgrade an existing pre-SWMR superblock in place.
-            # Closing this handle after each write preserves legacy portal
-            # access instead of leaving the file permanently locked.
-            self._legacy_paths.add(path)
-            return f, False
+        return f, False
 
-        self._files[path] = f
-        return f, True
+    def _evict_handle(self, path: Path) -> None:
+        """Drop and close a cached SWMR writer handle.
+
+        After a write/flush error the HDF5 handle can be left in an
+        inconsistent state (e.g. "slist already enabled"). If it stays in
+        ``self._files`` every subsequent packet for the device reuses the same
+        broken handle and fails forever. Removing it here forces the next
+        packet to reopen the file from disk, which recovers the stream.
+        Must be called while holding ``self._lock_for(path)``.
+        """
+        with self._locks_guard:
+            f = self._files.pop(path, None)
+        if f is None:
+            return
+        try:
+            f.close()
+        except Exception:
+            LOG.exception("failed to close broken HDF5 writer %s", path)
 
     def close(self) -> None:
-        """Flush and close persistent SWMR writer handles during shutdown."""
+        """Flush and close any stray writer handles at shutdown (normally none)."""
         with self._locks_guard:
             files = list(self._files.items())
             self._files.clear()
@@ -168,61 +267,82 @@ class DeviceDatabaseManager:
             cache = self._sha256_cache.setdefault(path, set())
             if header.sha256 in cache:
                 return InsertResult(path, device_id, False, True, [])
-            now, seq, stream = time.time(), get_sequence_number(packet), keys["stream_key"]
-            messages: list[str] = []
-            f, keep_open = self._open_for_write(path, device_id, keys)
             try:
-                grp = f.require_group(stream)
-                for k, v in keys.items():
+                return self._write_packet(client, packet, header, waveform, device_id, path, keys, cache)
+            except Exception:
+                # A write failure can leave an HDF5 handle in a broken state.
+                # Evict any stray handle so a fresh file is opened, then retry
+                # once. Only if the retry also fails does the caller quarantine
+                # the packet, so a single transient fault no longer permanently
+                # stalls the device's stream.
+                LOG.warning("HDF5 write failed for %s; evicting handle and retrying once", path)
+                self._evict_handle(path)
+                return self._write_packet(client, packet, header, waveform, device_id, path, keys, cache)
+
+    def _write_packet(self, client: ClientInfo, packet: bytes, header: MSeedHeader, waveform: np.ndarray,
+                       device_id: str, path: Path, keys: dict[str, str], cache: set[str]) -> InsertResult:
+        now, seq, stream = time.time(), get_sequence_number(packet), keys["stream_key"]
+        messages: list[str] = []
+        f, keep_open = self._open_for_write(path, device_id, keys)
+        try:
+            grp = f.require_group(stream)
+            for k, v in keys.items():
+                grp.attrs[k] = v
+            for k, v in {"last_seq": -1, "last_start": -1.0, "last_end": -1.0,
+                         "last_sampling_rate": -1.0, "last_npts": -1, "last_sha256": "", "updated_unix": now}.items():
+                if k not in grp.attrs:
                     grp.attrs[k] = v
-                for k, v in {"last_seq": -1, "last_start": -1.0, "last_end": -1.0,
-                             "last_sampling_rate": -1.0, "last_npts": -1, "last_sha256": "", "updated_unix": now}.items():
-                    if k not in grp.attrs:
-                        grp.attrs[k] = v
-                # The dataset name is deterministic.  Check it before gap detection so
-                # a retransmitted packet after a receiver restart neither gets stored
-                # again nor creates a false discontinuity event.
-                name = f"rec_{int(header.start_unix * 1_000_000_000):019d}_{seq:06d}_{header.sha256[:12]}"
-                if name in grp:
-                    cache.add(header.sha256)
-                    return InsertResult(path, device_id, False, True, [])
-                last_seq, last_start, last_end = int(grp.attrs["last_seq"]), float(grp.attrs["last_start"]), float(grp.attrs["last_end"])
-                if last_seq >= 0:
-                    expected_seq = (last_seq + 1) % 1_000_000
-                    if seq != expected_seq:
-                        self._gap(f, messages, stream, "sequence_gap", last_seq, seq, last_start, header.start_unix, last_end, -1.0, -1.0, now, f"Sequence discontinuity: prev={last_seq}, exp={expected_seq}, cur={seq}")
-                    if header.sampling_rate and header.sampling_rate > 0 and last_end > 0:
-                        delta = header.start_unix - last_end
-                        tolerance = self.config.parser.time_gap_tolerance_samples / header.sampling_rate
-                        if abs(delta) > tolerance:
-                            kind = "time_gap" if delta > 0 else "time_overlap"
-                            self._gap(f, messages, stream, kind, last_seq, seq, last_start, header.start_unix, last_end, last_end, delta, now, f"Time {'gap' if delta > 0 else 'overlap'}: delta={delta:.6f}s")
-                            if delta > tolerance and header.sampling_rate > 0:
-                                self._write_zero_gap(
-                                    grp, last_end, header.start_unix, header.sampling_rate,
-                                    np.asarray(waveform).dtype, {"chunks": True}, now, seq)
-                # Sequence numbers wrap; use time + SHA as the persistent unique dataset name.
-                options: dict[str, object] = {"chunks": True}
-                if self.config.storage.hdf5_compression:
-                    options["compression"] = self.config.storage.hdf5_compression
-                    if self.config.storage.hdf5_compression == "gzip":
-                        options["compression_opts"] = self.config.storage.hdf5_compression_opts
-                dset = grp.create_dataset(name, data=np.asarray(waveform), **options)
-                for key, value in {"start_unix": header.start_unix, "end_unix": header.end_unix if header.end_unix is not None else -1.0,
-                    "seq_no": seq, "sha256": header.sha256, "packet_len": len(packet), "record_length": header.record_length,
-                    "recv_unix": now, "client_ip": client.client_ip, "client_port": client.client_port, "server_port": client.server_port,
-                    "network": header.network, "station": header.station, "location": header.location, "channel": header.channel,
-                    "quality": header.quality, "sampling_rate": header.sampling_rate or 0.0, "npts": header.npts or len(waveform)}.items():
-                    dset.attrs[key] = value
-                # Preserve the exact incoming miniSEED record for faithful raw
-                # export; waveform data above remains optimized for plotting.
-                dset.attrs["raw_mseed"] = np.void(packet)
-                if header.start_unix > last_start:
-                    grp.attrs.update({"last_seq": seq, "last_start": header.start_unix, "last_end": header.end_unix if header.end_unix is not None else -1.0,
-                        "last_sampling_rate": header.sampling_rate or 0.0, "last_npts": header.npts or len(waveform), "last_sha256": header.sha256, "updated_unix": now})
-                f.flush()
-            finally:
-                if not keep_open:
-                    f.close()
-            cache.add(header.sha256)
+            # Create the rolling arrays up front, before any gap-fill or record
+            # append touches them.  _write_zero_gap and _append_record both index
+            # grp["samples"]/["index"], so the arrays must exist first; otherwise
+            # a time gap on the very first packet to a group (or any legacy rec_*
+            # group being upgraded) raises KeyError: 'samples' doesn't exist.
+            self._ensure_stream_arrays(grp, np.asarray(waveform).dtype)
+            # The dataset name is deterministic.  Check it before gap detection so
+            # a retransmitted packet after a receiver restart neither gets stored
+            # again nor creates a false discontinuity event.
+            # Duplicate detection now uses the per-stream sha256 cache instead
+            # of probing for a dataset name.  Seed the cache from the rolling
+            # index on first touch so retransmits after a receiver restart are
+            # still recognised and neither re-stored nor flagged as gaps.
+            if "index" in grp and (path, stream) not in self._seeded:
+                try:
+                    shas = grp["index"]["sha256"]
+                    for s in shas:
+                        sv = s.decode("ascii", "replace").rstrip("\x00") if isinstance(s, (bytes, np.bytes_)) else str(s)
+                        if sv:
+                            cache.add(sv)
+                except Exception:
+                    pass
+                self._seeded.add((path, stream))
+            if header.sha256 in cache:
+                return InsertResult(path, device_id, False, True, [])
+            last_seq, last_start, last_end = int(grp.attrs["last_seq"]), float(grp.attrs["last_start"]), float(grp.attrs["last_end"])
+            if last_seq >= 0:
+                expected_seq = (last_seq + 1) % 1_000_000
+                if seq != expected_seq:
+                    self._gap(f, messages, stream, "sequence_gap", last_seq, seq, last_start, header.start_unix, last_end, -1.0, -1.0, now, f"Sequence discontinuity: prev={last_seq}, exp={expected_seq}, cur={seq}")
+                if header.sampling_rate and header.sampling_rate > 0 and last_end > 0:
+                    delta = header.start_unix - last_end
+                    tolerance = self.config.parser.time_gap_tolerance_samples / header.sampling_rate
+                    if abs(delta) > tolerance:
+                        kind = "time_gap" if delta > 0 else "time_overlap"
+                        self._gap(f, messages, stream, kind, last_seq, seq, last_start, header.start_unix, last_end, last_end, delta, now, f"Time {'gap' if delta > 0 else 'overlap'}: delta={delta:.6f}s")
+                        if delta > tolerance and header.sampling_rate > 0:
+                            self._write_zero_gap(
+                                grp, last_end, header.start_unix, header.sampling_rate,
+                                np.asarray(waveform).dtype, {"chunks": True}, now, seq)
+            # Rolling-array layout: append waveform + raw bytes + one index row,
+            # instead of creating a dataset per record (which exploded the HDF5
+            # object count on long-lived streams and slowed every open/scan).
+            # Arrays were already ensured right after require_group above.
+            self._append_record(grp, waveform, packet, header, seq, now)
+            if header.start_unix > last_start:
+                grp.attrs.update({"last_seq": seq, "last_start": header.start_unix, "last_end": header.end_unix if header.end_unix is not None else -1.0,
+                    "last_sampling_rate": header.sampling_rate or 0.0, "last_npts": header.npts or len(waveform), "last_sha256": header.sha256, "updated_unix": now})
+            f.flush()
+        finally:
+            if not keep_open:
+                f.close()
+        cache.add(header.sha256)
         return InsertResult(path, device_id, True, False, messages)

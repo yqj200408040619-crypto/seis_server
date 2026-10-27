@@ -5,7 +5,7 @@ import sqlite3
 import time
 from typing import Any
 
-from .security import hash_password, verify_password
+from .security import hash_password, verify_password, needs_rehash
 
 
 SCHEMA = """
@@ -82,16 +82,56 @@ def get_user_by_id(app_db_path: str, user_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def authenticate_user(app_db_path: str, username: str, password: str) -> sqlite3.Row | None:
-    user = get_user_by_username(app_db_path, username)
-    if user is None:
-        return None
-    if not verify_password(password, user["password_hash"]):
-        return None
+class AuthResult:
+    """Outcome of an authentication attempt.
+
+    ``reason`` is one of: ``ok``, ``no_such_user``, ``disabled``,
+    ``bad_password``. It lets the caller write a precise audit log without
+    leaking which part failed to the end user.
+    """
+
+    __slots__ = ("user", "reason")
+
+    def __init__(self, user: sqlite3.Row | None, reason: str):
+        self.user = user
+        self.reason = reason
+
+    @property
+    def ok(self) -> bool:
+        return self.reason == "ok"
+
+
+def _get_user_any_state(app_db_path: str, username: str) -> sqlite3.Row | None:
     with connect(app_db_path) as conn:
-        conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (time.time(), user["id"]))
+        return conn.execute(
+            "SELECT * FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+
+
+def authenticate_user(app_db_path: str, username: str, password: str) -> AuthResult:
+    # Look the user up regardless of active state so we can report the precise
+    # failure reason (missing vs. disabled) in the audit log.
+    user = _get_user_any_state(app_db_path, username)
+    if user is None:
+        return AuthResult(None, "no_such_user")
+    if not int(user["is_active"]):
+        return AuthResult(None, "disabled")
+    if not verify_password(password, user["password_hash"]):
+        return AuthResult(None, "bad_password")
+
+    now = time.time()
+    with connect(app_db_path) as conn:
+        conn.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (now, user["id"]))
+        # Transparently upgrade legacy / weaker hashes to current bcrypt once we
+        # have the plaintext in hand and it verified successfully.
+        if needs_rehash(user["password_hash"]):
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (hash_password(password), user["id"]),
+            )
         conn.commit()
-    return user
+    return AuthResult(user, "ok")
 
 
 def create_or_update_user(
