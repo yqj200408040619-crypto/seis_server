@@ -12,6 +12,13 @@ class ServerConfig:
     backlog: int = 128
     recv_size: int = 8192
     socket_timeout_sec: int = 120
+    # Per-recv blocking timeout is socket_timeout_sec. If an instrument
+    # stops sending but leaves the TCP connection half-open, no bytes ever
+    # arrive again; without an application-level idle cap the handler would
+    # loop forever on recv timeouts, keeping a dead/zombie connection and
+    # blocking fresh data. idle_timeout_sec closes a connection after this
+    # many seconds with zero received bytes (0 disables reaping).
+    idle_timeout_sec: int = 300
     tcp_keepalive: bool = True
     # 100+ instruments commonly keep long-lived TCP sessions. Leave capacity
     # for reconnect storms without accepting an unbounded number of handlers.
@@ -89,6 +96,7 @@ def load_config(path: str | Path | None) -> AppConfig:
         backlog=_get_int(cp, "server", "backlog", ServerConfig.backlog),
         recv_size=_get_int(cp, "server", "recv_size", ServerConfig.recv_size),
         socket_timeout_sec=_get_int(cp, "server", "socket_timeout_sec", ServerConfig.socket_timeout_sec),
+        idle_timeout_sec=_get_int(cp, "server", "idle_timeout_sec", ServerConfig.idle_timeout_sec),
         tcp_keepalive=_get_bool(cp, "server", "tcp_keepalive", ServerConfig.tcp_keepalive),
         max_clients=_get_int(cp, "server", "max_clients", ServerConfig.max_clients),
         writer_threads=_get_int(cp, "server", "writer_threads", ServerConfig.writer_threads),

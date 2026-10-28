@@ -17,11 +17,14 @@ from . import app_db
 from .config import DEFAULT_CONFIG_PATH, load_settings
 from .data_reader import (
     device_summary,
+    device_summary_multi,
     discover_devices,
     discover_obn_devices,          # 新增：用于扫描 OBN 设备
     list_components,
+    list_components_multi,
     parse_datetime_or_unix,
     read_waveform,
+    read_waveform_multi,
     safe_receiver_db_path,
 )
 
@@ -36,6 +39,29 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("mseed_web_portal")
+
+def _device_file_set(d) -> list[str]:
+    """Resolve the full set of HDF5 files backing a logical device.
+
+    Returns the device's own db_path first, followed by any merge-member file
+    paths attached to it (empty for ordinary, unmerged devices).  All paths are
+    validated through safe_receiver_db_path; unresolvable members are skipped so
+    a stale mapping can never break a read.
+    """
+    paths: list[str] = []
+    try:
+        paths.append(safe_receiver_db_path(settings.receiver_db_dir, d["db_path"]))
+    except Exception as exc:
+        log.warning("primary db_path invalid for device id=%s: %s", d["id"], exc)
+    for mp in app_db.get_device_member_paths(settings.app_db, int(d["id"])):
+        try:
+            sp = safe_receiver_db_path(settings.receiver_db_dir, mp)
+        except Exception as exc:
+            log.warning("member db_path invalid for device id=%s: %s", d["id"], exc)
+            continue
+        if sp not in paths:
+            paths.append(sp)
+    return paths
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 templates = Jinja2Templates(directory=os.path.join(BASE_DIR, "templates"))
@@ -356,9 +382,9 @@ def api_devices(user: dict[str, Any] = Depends(current_user)):
         components = []
         summary = {"total_packets": 0, "last_start": None}
         try:
-            safe_path = safe_receiver_db_path(settings.receiver_db_dir, d["db_path"])
-            components = list_components(safe_path, d["device_key"])
-            summary = device_summary(safe_path, d["device_key"])
+            file_set = _device_file_set(d)
+            components = list_components_multi(file_set, d["device_key"])
+            summary = device_summary_multi(file_set, d["device_key"])
         except Exception as exc:
             log.warning("failed to list components device id=%s: %s", d["id"], exc)
         payload.append({
@@ -380,8 +406,8 @@ def api_components(device_id: int = Query(...), user: dict[str, Any] = Depends(c
     d = app_db.get_device_for_user(settings.app_db, device_id, int(user["id"]), admin=is_admin(user))
     if not d:
         raise HTTPException(status_code=404, detail="Device not found")
-    safe_path = safe_receiver_db_path(settings.receiver_db_dir, d["db_path"])
-    return {"device_id": device_id, "components": list_components(safe_path, d["device_key"])}
+    file_set = _device_file_set(d)
+    return {"device_id": device_id, "components": list_components_multi(file_set, d["device_key"])}
 
 
 @app.get("/api/waveform")
@@ -400,10 +426,10 @@ def api_waveform(
     now = time.time()
     end_unix = parse_datetime_or_unix(end, default=now)
     start_unix = parse_datetime_or_unix(start, default=end_unix - seconds)
-    safe_path = safe_receiver_db_path(settings.receiver_db_dir, d["db_path"])
+    file_set = _device_file_set(d)
     try:
-        data = read_waveform(
-            safe_path,
+        data = read_waveform_multi(
+            file_set,
             device_key=d["device_key"],
             component=component,
             start_unix=start_unix,

@@ -64,6 +64,7 @@ def init_db(app_db_path: str) -> None:
     with connect(app_db_path) as conn:
         conn.executescript(SCHEMA)
         conn.commit()
+    migrate_device_merge_members(app_db_path)
 
 
 def get_user_by_username(app_db_path: str, username: str) -> sqlite3.Row | None:
@@ -669,14 +670,27 @@ def upsert_device(
         cols = _bulk_columns(conn, "devices")
         row = conn.execute("SELECT id FROM devices WHERE db_path = ? AND device_key = ?", (db_path, device_key)).fetchone()
         if row:
+            # If this file is a merge member of another (primary) device, keep it
+            # hidden so the periodic device sync does not un-hide merged
+            # duplicates.  Membership is looked up defensively (table may not
+            # exist on very old databases).
+            is_member = False
+            try:
+                is_member = conn.execute(
+                    "SELECT 1 FROM device_merge_members WHERE member_db_path = ? LIMIT 1",
+                    (db_path,),
+                ).fetchone() is not None
+            except Exception:
+                is_member = False
+            keep_active = 0 if is_member else 1
             conn.execute(
                 """
                 UPDATE devices
                 SET label = ?, instrument_type = ?, instrument_serial = ?, client_ip = ?,
-                    server_port = ?, is_active = 1, updated_at = ?
+                    server_port = ?, is_active = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (label, instrument_type, instrument_serial, client_ip, server_port, now, row["id"]),
+                (label, instrument_type, instrument_serial, client_ip, server_port, keep_active, now, row["id"]),
             )
             conn.commit()
             device_id = int(row["id"])
@@ -889,3 +903,116 @@ def stage5_create_or_update_user_safe(
         cur = conn.execute(f"INSERT INTO users ({', '.join(insert_cols)}) VALUES ({placeholders})", vals)
         conn.commit()
         return int(cur.lastrowid)
+
+
+# ============================================================================
+# Logical device merge support (non-destructive).
+#
+# Duplicate instrument registrations occur because the TCP receiver writes one
+# HDF5 file per (client_ip, port, instrument).  When the same instrument shows
+# up from several source IPs and the stored time ranges DO NOT overlap, those
+# files are really one logical device.  Instead of rewriting the .h5 files, we
+# keep every file intact and record a mapping: one "primary" device row owns a
+# set of extra "member" file paths.  The read path then reads across the
+# primary file plus all member files.  Member device rows are deactivated
+# (hidden) but preserved, so the whole operation is fully reversible.
+# ============================================================================
+
+def migrate_device_merge_members(app_db_path: str) -> None:
+    """Create the device_merge_members table if it does not exist (idempotent)."""
+    with connect(app_db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_merge_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                primary_device_id INTEGER NOT NULL,
+                member_db_path TEXT NOT NULL,
+                member_device_key TEXT NOT NULL,
+                member_device_id INTEGER,
+                created_at REAL NOT NULL,
+                UNIQUE(primary_device_id, member_db_path),
+                FOREIGN KEY (primary_device_id) REFERENCES devices(id) ON DELETE CASCADE
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_device_merge_primary ON device_merge_members(primary_device_id)"
+        )
+        conn.commit()
+
+
+def add_device_member(app_db_path: str, primary_device_id: int, member_db_path: str,
+                      member_device_key: str, member_device_id: int | None = None) -> None:
+    """Attach a member file path to a primary device (idempotent)."""
+    migrate_device_merge_members(app_db_path)
+    with connect(app_db_path) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO device_merge_members
+            (primary_device_id, member_db_path, member_device_key, member_device_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (primary_device_id, member_db_path, member_device_key, member_device_id, time.time()),
+        )
+        conn.commit()
+
+
+def get_device_member_paths(app_db_path: str, primary_device_id: int) -> list[str]:
+    """Return the extra member file paths attached to a primary device.
+
+    Returns [] when the device has no members (the common case), so callers can
+    always build ``[primary_path, *members]`` safely.
+    """
+    migrate_device_merge_members(app_db_path)
+    with connect(app_db_path) as conn:
+        rows = conn.execute(
+            "SELECT member_db_path FROM device_merge_members WHERE primary_device_id = ? ORDER BY id",
+            (primary_device_id,),
+        ).fetchall()
+    return [str(r["member_db_path"]) for r in rows]
+
+
+def list_device_members(app_db_path: str, primary_device_id: int) -> list[sqlite3.Row]:
+    """Full member rows for a primary device (for tooling / unmerge)."""
+    migrate_device_merge_members(app_db_path)
+    with connect(app_db_path) as conn:
+        return list(conn.execute(
+            "SELECT * FROM device_merge_members WHERE primary_device_id = ? ORDER BY id",
+            (primary_device_id,),
+        ))
+
+
+def clear_device_members(app_db_path: str, primary_device_id: int) -> list[sqlite3.Row]:
+    """Remove all member mappings for a primary device; return removed rows.
+
+    Does NOT reactivate the member device rows — the caller (unmerge) decides,
+    so that this stays a pure mapping operation.
+    """
+    migrate_device_merge_members(app_db_path)
+    with connect(app_db_path) as conn:
+        removed = list(conn.execute(
+            "SELECT * FROM device_merge_members WHERE primary_device_id = ?",
+            (primary_device_id,),
+        ))
+        conn.execute("DELETE FROM device_merge_members WHERE primary_device_id = ?", (primary_device_id,))
+        conn.commit()
+    return removed
+
+
+def all_merge_mappings(app_db_path: str) -> list[sqlite3.Row]:
+    """Every merge-member row across all primaries (for audit / unmerge-all)."""
+    migrate_device_merge_members(app_db_path)
+    with connect(app_db_path) as conn:
+        return list(conn.execute(
+            "SELECT * FROM device_merge_members ORDER BY primary_device_id, id"
+        ))
+
+
+def set_device_active(app_db_path: str, device_id: int, active: bool) -> None:
+    """Toggle a device row's visibility without deleting it (reversible)."""
+    with connect(app_db_path) as conn:
+        conn.execute(
+            "UPDATE devices SET is_active = ?, updated_at = ? WHERE id = ?",
+            (1 if active else 0, time.time(), device_id),
+        )
+        conn.commit()

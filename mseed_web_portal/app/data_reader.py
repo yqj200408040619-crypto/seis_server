@@ -843,3 +843,162 @@ def export_gaps_stage3(db_path: str, *, device_key: str, start_unix: float, end_
                        limit: int = 500) -> list[dict[str, Any]]:
     result = quality_summary(db_path, device_key, limit=limit)
     return [gap for gap in result["gaps"] if start_unix <= float(gap.get("current_start", -1)) <= end_unix]
+
+
+# ============================================================================
+# Multi-file (merged logical device) read helpers.
+#
+# A logical device may span several HDF5 files whose stored time ranges are
+# disjoint (same instrument seen from different source IPs).  These wrappers
+# call the existing single-file readers once per file and combine the results.
+# Because the member files are guaranteed time-disjoint by the merge tool, the
+# combined traces never overlap and can simply be concatenated and re-sorted.
+# Passing a single-element list reproduces the original single-file behaviour.
+# ============================================================================
+
+def list_components_multi(db_paths: list[str], device_key: str | None = None) -> list[dict[str, Any]]:
+    """Union of components across all member files (summing packet counts)."""
+    merged: dict[str, dict[str, Any]] = {}
+    for path in db_paths:
+        try:
+            comps = list_components(path, device_key)
+        except Exception:
+            continue
+        for c in comps:
+            key = str(c.get("stream_key") or c.get("component"))
+            if key not in merged:
+                merged[key] = dict(c)
+            else:
+                m = merged[key]
+                m["packets"] = int(m.get("packets") or 0) + int(c.get("packets") or 0)
+                ls_old, ls_new = m.get("last_start"), c.get("last_start")
+                if ls_new is not None:
+                    m["last_start"] = ls_new if ls_old is None else max(float(ls_old), float(ls_new))
+    return sorted(merged.values(), key=lambda item: (str(item.get("component")), str(item.get("stream_key"))))
+
+
+def device_summary_multi(db_paths: list[str], device_key: str | None = None) -> dict[str, Any]:
+    """Combine per-file device summaries into one logical-device summary."""
+    if not db_paths:
+        return {"components": [], "total_packets": 0, "last_start": None,
+                "age_seconds": None, "status": "offline", "one_hour_packets": 0,
+                "component_status": [], "gap_count": 0, "duplicate_count": 0,
+                "bad_packet_count": 0}
+    if len(db_paths) == 1:
+        return device_summary(db_paths[0], device_key)
+
+    total_packets = 0
+    one_hour_packets = 0
+    last_start: float | None = None
+    gap_count = duplicate_count = bad_packet_count = 0
+    for path in db_paths:
+        try:
+            s = device_summary(path, device_key)
+        except Exception:
+            continue
+        total_packets += int(s.get("total_packets") or 0)
+        one_hour_packets += int(s.get("one_hour_packets") or 0)
+        ls = s.get("last_start")
+        if ls is not None:
+            last_start = float(ls) if last_start is None else max(last_start, float(ls))
+        gap_count += int(s.get("gap_count") or 0)
+        duplicate_count += int(s.get("duplicate_count") or 0)
+        bad_packet_count += int(s.get("bad_packet_count") or 0)
+
+    comps = list_components_multi(db_paths, device_key)
+    now = time.time()
+    age_seconds = now - last_start if last_start is not None else None
+    status = "online" if age_seconds is not None and age_seconds <= 600 else (
+        "stale" if age_seconds is not None and age_seconds <= 3600 else "offline")
+    component_status = []
+    for comp in comps:
+        comp_last = comp.get("last_start")
+        comp_age = now - float(comp_last) if comp_last is not None else None
+        component_status.append({**comp, "age_seconds": comp_age,
+            "status": "online" if comp_age is not None and comp_age <= 600 else (
+                "stale" if comp_age is not None and comp_age <= 3600 else "offline")})
+    return {
+        "components": comps,
+        "total_packets": total_packets,
+        "last_start": last_start,
+        "age_seconds": age_seconds,
+        "status": status,
+        "one_hour_packets": one_hour_packets,
+        "component_status": component_status,
+        "gap_count": gap_count,
+        "duplicate_count": duplicate_count,
+        "bad_packet_count": bad_packet_count,
+    }
+
+
+def read_waveform_multi(db_paths: list[str], *, device_key: str, component: str | None,
+                        start_unix: float, end_unix: float, max_points: int,
+                        max_records: int) -> dict[str, Any]:
+    """Read the same time window from every member file and merge the traces.
+
+    Member files are time-disjoint, so traces for the same stream_key are simply
+    concatenated and re-sorted by time.  A final per-stream min/max downsample
+    keeps the returned point count bounded like the single-file reader.
+    """
+    if not db_paths:
+        return {"points": [], "traces": [], "packet_count": 0, "raw_bytes": 0,
+                "truncated_records": False, "generated_at": time.time()}
+    if len(db_paths) == 1:
+        return read_waveform(db_paths[0], device_key=device_key, component=component,
+                             start_unix=start_unix, end_unix=end_unix,
+                             max_points=max_points, max_records=max_records)
+
+    packet_count = 0
+    raw_bytes = 0
+    truncated = False
+    by_stream: dict[str, dict[str, Any]] = {}
+    remaining = max_records
+    for path in db_paths:
+        try:
+            part = read_waveform(path, device_key=device_key, component=component,
+                                 start_unix=start_unix, end_unix=end_unix,
+                                 max_points=max_points, max_records=max(1, remaining))
+        except Exception:
+            continue
+        packet_count += int(part.get("packet_count") or 0)
+        raw_bytes += int(part.get("raw_bytes") or 0)
+        truncated = truncated or bool(part.get("truncated_records"))
+        remaining = max(0, max_records - packet_count)
+        for tr in part.get("traces", []):
+            sk = tr.get("stream_key") or tr.get("component")
+            if sk not in by_stream:
+                by_stream[sk] = {
+                    "stream_key": sk,
+                    "component": tr.get("component"),
+                    "sampling_rate": tr.get("sampling_rate"),
+                    "npts_original": int(tr.get("npts_original") or 0),
+                    "points": list(tr.get("points") or []),
+                }
+            else:
+                agg = by_stream[sk]
+                agg["npts_original"] += int(tr.get("npts_original") or 0)
+                agg["points"].extend(tr.get("points") or [])
+
+    traces_payload = []
+    total_points = 0
+    for sk, agg in by_stream.items():
+        pts = sorted(agg["points"], key=lambda p: p["t"])
+        if len(pts) > max_points:
+            t = np.asarray([p["t"] for p in pts], dtype=np.float64)
+            y = np.asarray([p["y"] for p in pts], dtype=np.float64)
+            t, y = minmax_downsample(t, y, max_points)
+            pts = [{"t": float(a), "y": float(b)} for a, b in zip(t, y)]
+        agg["points"] = pts
+        total_points += len(pts)
+        traces_payload.append(agg)
+
+    traces_payload.sort(key=lambda tr: str(tr.get("component") or tr.get("stream_key")))
+    return {
+        "points": traces_payload[0]["points"] if len(traces_payload) == 1 else [],
+        "traces": traces_payload,
+        "packet_count": packet_count,
+        "raw_bytes": raw_bytes,
+        "point_count": total_points,
+        "truncated_records": truncated,
+        "generated_at": time.time(),
+    }
