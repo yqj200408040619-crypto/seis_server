@@ -118,24 +118,67 @@ class MSeedWritePipeline:
                 work_queue.task_done()
 
     def close(self, drain_timeout_sec: float = 30.0) -> None:
+        """Stop accepting work and shut the writers down WITHOUT leaving any
+        HDF5 file mid-write.
+
+        Two phases, each with its own budget:
+
+        1. Best-effort drain: wait up to ``drain_timeout_sec`` for the already
+           queued packets to be persisted. A large backlog may not fully drain;
+           that is acceptable (those packets are lost on shutdown) — what is
+           NOT acceptable is abandoning a worker mid-write, which leaves the
+           device HDF5 file with its consistency flag set ("already open for
+           write") so the portal cannot read it until h5clear.
+
+        2. Guaranteed clean stop: ALWAYS send each worker its None sentinel and
+           ALWAYS give it a bounded grace period to return. Because a worker
+           only holds an h5py handle for the duration of a single insert_packet
+           (append-open then close), once it has consumed the sentinel and
+           returned, no file is left open. This phase must NOT be gated by the
+           drain deadline (the previous implementation gated marker delivery on
+           the expired deadline, so under a real backlog the workers never got
+           their sentinel and were left running mid-write — the exact cause of
+           locked files observed in the canary run).
+        """
         self.stopping.set()
-        deadline = time.monotonic() + drain_timeout_sec
+
+        # Phase 1: best-effort drain of queued work.
+        drain_deadline = time.monotonic() + max(0.0, drain_timeout_sec)
         for work_queue in self.queues:
-            while work_queue.unfinished_tasks and time.monotonic() < deadline:
+            while work_queue.unfinished_tasks and time.monotonic() < drain_deadline:
                 time.sleep(0.05)
             if work_queue.unfinished_tasks:
-                LOG.warning("miniSEED shutdown drain timeout; %d queued packets remain", work_queue.qsize())
+                LOG.warning("miniSEED shutdown drain timeout; %d queued packets remain (will stop workers cleanly)",
+                            work_queue.qsize())
+
+        # Phase 2: ALWAYS deliver the sentinel and let each worker finish its
+        # current write and exit. Budget is independent of the drain deadline.
+        stop_deadline = time.monotonic() + 10.0
         for index, work_queue in enumerate(self.queues):
-            while time.monotonic() < deadline:
+            delivered = False
+            while time.monotonic() < stop_deadline:
                 try:
-                    work_queue.put(None, timeout=0.1)
+                    work_queue.put(None, timeout=0.2)
+                    delivered = True
                     break
                 except queue.Full:
-                    pass
-            else:
+                    # Queue still full of backlog we won't drain; make room so
+                    # the sentinel can be delivered and the worker can exit.
+                    try:
+                        work_queue.get_nowait()
+                        work_queue.task_done()
+                    except queue.Empty:
+                        pass
+            if not delivered:
                 LOG.warning("miniSEED worker %d could not be sent its shutdown marker", index)
+
         for worker in self.workers:
-            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            worker.join(timeout=10.0)
+            if worker.is_alive():
+                LOG.warning("miniSEED worker %s did not exit within grace period", worker.name)
+
+        # Closes any handle still cached (normally none, since writes use
+        # append-open-then-close); safe to call unconditionally.
         self.db_manager.close()
 
 
