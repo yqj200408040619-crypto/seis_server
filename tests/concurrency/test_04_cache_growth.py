@@ -27,31 +27,78 @@ from __future__ import annotations
 
 import hashlib
 import threading
+import time
 import tracemalloc
+from collections import OrderedDict
 from pathlib import Path
 
 
-class CacheModel:
-    """Byte-for-byte reproduction of the growth-relevant state in db.py."""
+# --- BoundedShaCache: copied verbatim from mseed_tcp_server/db.py (can't import
+#     the module here because it pulls in h5py). Kept in sync by hand. ---
+class BoundedShaCache:
+    __slots__ = ("_od", "max_size")
 
-    def __init__(self):
+    def __init__(self, max_size: int):
+        self._od = OrderedDict()
+        self.max_size = max(0, int(max_size))
+
+    def __contains__(self, sha: str) -> bool:
+        if sha in self._od:
+            self._od.move_to_end(sha)
+            return True
+        return False
+
+    def add(self, sha: str) -> None:
+        if not sha:
+            return
+        if sha in self._od:
+            self._od.move_to_end(sha)
+            return
+        self._od[sha] = None
+        if self.max_size and len(self._od) > self.max_size:
+            self._od.popitem(last=False)
+
+    def __len__(self) -> int:
+        return len(self._od)
+
+
+class CacheModel:
+    """Reproduction of the growth-relevant state in db.py AFTER the fix:
+    bounded per-stream sha cache + TTL pruning of idle device entries.
+    """
+
+    def __init__(self, sha_cap: int = 20000, device_ttl: int = 86400):
         self._locks_guard = threading.Lock()
         self._locks: dict[Path, threading.Lock] = {}
-        self._sha256_cache: dict[Path, set[str]] = {}
-        self._seeded: set[tuple[Path, str]] = set()
+        self._sha256_cache: dict[Path, BoundedShaCache] = {}
+        self._last_active: dict[Path, float] = {}
+        self._seeded: dict[Path, set[str]] = {}
+        self._sha_cap = sha_cap
+        self._device_ttl = device_ttl
 
     def _lock_for(self, path: Path) -> threading.Lock:
         with self._locks_guard:
             return self._locks.setdefault(path, threading.Lock())
 
-    def insert(self, path: Path, stream: str, sha: str) -> bool:
+    def insert(self, path: Path, stream: str, sha: str, now: float | None = None) -> bool:
+        now = now if now is not None else time.time()
         with self._lock_for(path):
-            cache = self._sha256_cache.setdefault(path, set())
+            self._last_active[path] = now
+            cache = self._sha256_cache.setdefault(path, BoundedShaCache(self._sha_cap))
             if sha in cache:
                 return False
-            self._seeded.add((path, stream))
+            self._seeded.setdefault(path, set()).add(stream)
             cache.add(sha)
             return True
+
+    def prune(self, now: float) -> int:
+        stale = [p for p, ts in self._last_active.items() if now - ts > self._device_ttl]
+        for path in stale:
+            self._locks.pop(path, None)
+            self._sha256_cache.pop(path, None)
+            self._last_active.pop(path, None)
+            self._seeded.pop(path, None)
+        return len(stale)
 
 
 def human(n: int) -> str:
@@ -62,64 +109,102 @@ def human(n: int) -> str:
     return f"{n:.1f}TB"
 
 
-def test_single_stream_growth():
-    """4.1 — one busy device, many unique records."""
-    m = CacheModel()
+# The production default is StorageConfig.sha256_cache_max_per_stream = 20000.
+# Tests use a smaller cap so "far beyond the cap" runs fast; the LRU logic is
+# identical regardless of the numeric cap.
+SHA_CAP = 2_000
+
+
+def _cache_footprint(cache: "BoundedShaCache") -> int:
+    """Approximate resident bytes of a sha cache: the OrderedDict container plus
+    one 64-char str per retained entry (64 ASCII chars -> ~113 B on CPython)."""
+    import sys
+    total = sys.getsizeof(cache._od)
+    for k in cache._od:
+        total += sys.getsizeof(k)
+    return total
+
+
+def _feed(m, path, n_records):
+    for i in range(n_records):
+        m.insert(path, "NN.STA..CH", hashlib.sha256(i.to_bytes(8, "big")).hexdigest())
+    return _cache_footprint(m._sha256_cache[path])
+
+
+def test_single_stream_bounded():
+    """4.1 FIX — cache size is capped, and memory is flat as N grows well past
+    the cap (we compare N = 5x cap vs N = 10x cap: heap should barely change)."""
     path = Path("/var/lib/mseed-tcp-server/devices/DEV_ONE.h5")
+
+    m1 = CacheModel(sha_cap=SHA_CAP)
+    grew_5x = _feed(m1, path, SHA_CAP * 5)
+    len_5x = len(m1._sha256_cache[path])
+
+    m2 = CacheModel(sha_cap=SHA_CAP)
+    grew_10x = _feed(m2, path, SHA_CAP * 10)
+    len_10x = len(m2._sha256_cache[path])
+
+    bounded = (len_5x <= SHA_CAP) and (len_10x <= SHA_CAP)
+    # heap should NOT scale with N: doubling the feed keeps footprint ~same.
+    flat = grew_10x <= grew_5x * 1.5
+    print(f"[4.1] fed 5x cap  ({SHA_CAP*5:,}): cache size={len_5x:,}  heap={human(grew_5x)}")
+    print(f"      fed 10x cap ({SHA_CAP*10:,}): cache size={len_10x:,}  heap={human(grew_10x)}")
+    print(f"      size capped at {SHA_CAP:,} = {bounded}; heap flat as N doubles = {flat}")
+    print(f"      LRU eviction -> memory no longer scales with stream lifetime")
+    return (bounded and flat), grew_10x
+
+
+def test_dedup_still_works_in_window():
+    """A recent duplicate (within the LRU window) is still rejected."""
+    m = CacheModel(sha_cap=SHA_CAP)
+    path = Path("/var/lib/mseed-tcp-server/devices/DEV_DUP.h5")
     stream = "NN.STA..CH"
-    tracemalloc.start()
-    base = tracemalloc.take_snapshot()
-    N = 200_000  # a single busy 100 Hz stream reaches this in well under a day
-    for i in range(N):
-        sha = hashlib.sha256(i.to_bytes(8, "big")).hexdigest()
-        m.insert(path, stream, sha)
-    cur = tracemalloc.take_snapshot()
-    stats = cur.compare_to(base, "filename")
-    grew = sum(s.size_diff for s in stats)
-    tracemalloc.stop()
-    cache_len = len(m._sha256_cache[path])
-    per_record = grew / N
-    # extrapolate to a realistic long run
-    one_day_100hz_records = 100 * 60 * 60 * 24  # pessimistic: 1 rec/sample-sec slot
-    print(f"[4.1] single stream: {N:,} unique records")
-    print(f"      sha256 set size = {cache_len:,} entries")
-    print(f"      heap growth     = {human(grew)}  (~{per_record:.0f} B/record)")
-    print(f"      NO eviction/LRU -> growth is monotonic for stream lifetime")
-    return grew, per_record
+    sha_a = "a" * 64
+    assert m.insert(path, stream, sha_a) is True          # first time -> stored
+    accepted_again = m.insert(path, stream, sha_a)          # immediate retransmit
+    # push many others but stay within the window so sha_a is not evicted
+    for i in range(SHA_CAP - 10):
+        m.insert(path, stream, hashlib.sha256(i.to_bytes(8, "big")).hexdigest())
+    accepted_after_window = m.insert(path, stream, sha_a)   # still recent
+    ok = (accepted_again is False) and (accepted_after_window is False)
+    print(f"[4.1] recent-duplicate rejection preserved = {ok}")
+    return ok
 
 
-def test_many_devices_growth():
-    """4.2 — many distinct device-files, dict entries never reclaimed."""
-    m = CacheModel()
-    tracemalloc.start()
-    base = tracemalloc.take_snapshot()
-    D = 50_000  # distinct device_ids (e.g. churn of client_ip/port combos)
+def test_many_devices_pruned():
+    """4.2 FIX — idle device-file entries are reclaimed by TTL pruning."""
+    m = CacheModel(sha_cap=SHA_CAP, device_ttl=3600)
+    t0 = 1_000_000.0
+    D = 50_000
     for d in range(D):
         path = Path(f"/var/lib/mseed-tcp-server/devices/DEV_{d}.h5")
-        stream = f"NN.S{d}..CH"
-        m.insert(path, stream, "0" * 64)
-    cur = tracemalloc.take_snapshot()
-    stats = cur.compare_to(base, "filename")
-    grew = sum(s.size_diff for s in stats)
-    tracemalloc.stop()
-    print(f"[4.2] distinct device-files = {D:,}")
-    print(f"      _locks entries         = {len(m._locks):,}")
-    print(f"      _sha256_cache entries  = {len(m._sha256_cache):,}")
-    print(f"      _seeded entries        = {len(m._seeded):,}")
-    print(f"      heap growth            = {human(grew)}  (~{grew / D:.0f} B/device)")
-    print(f"      NO pruning -> grows with every device ever seen, never freed")
-    return grew
+        m.insert(path, f"NN.S{d}..CH", "0" * 64, now=t0)
+    before = len(m._locks)
+    # 10 devices stay active (written "recently"); the rest go idle.
+    t1 = t0 + 7200  # 2h later; ttl=1h
+    for d in range(10):
+        path = Path(f"/var/lib/mseed-tcp-server/devices/DEV_{d}.h5")
+        m.insert(path, f"NN.S{d}..CH", f"active{d}".encode().hex().ljust(64, "0")[:64], now=t1)
+    pruned = m.prune(now=t1)
+    after = len(m._locks)
+    reclaimed_ok = (before == D) and (after == 10) and (pruned == D - 10)
+    print(f"[4.2] device-files seen={before:,}  after prune={after:,}  pruned={pruned:,}")
+    print(f"      _sha256_cache entries = {len(m._sha256_cache):,}  _seeded = {len(m._seeded):,}")
+    print(f"      idle entries reclaimed, active ones kept = {reclaimed_ok}")
+    return reclaimed_ok
 
 
 def main():
-    g1, per = test_single_stream_growth()
+    bounded, grew = test_single_stream_bounded()
+    dedup_ok = test_dedup_still_works_in_window()
     print()
-    g2 = test_many_devices_growth()
+    pruned_ok = test_many_devices_pruned()
     print("\n--- summary ---")
-    print(f"4.1 single-stream sha256 cache growth : CONFIRMED (~{per:.0f} B/record, unbounded)")
-    print(f"4.2 per-device dict growth            : CONFIRMED (never pruned)")
-    # both confirmed defects => exit 0
-    return 0
+    print(f"4.1 FIX bounded sha cache     : {'VERIFIED' if bounded else 'FAILED'} "
+          f"(size capped at {SHA_CAP:,}, heap flat)")
+    print(f"4.1 recent-dup still rejected : {'VERIFIED' if dedup_ok else 'FAILED'}")
+    print(f"4.2 FIX idle-device pruning   : {'VERIFIED' if pruned_ok else 'FAILED'}")
+    return 0 if (bounded and dedup_ok and pruned_ok) else 1
 
 
 if __name__ == "__main__":

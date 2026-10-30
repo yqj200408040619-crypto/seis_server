@@ -28,7 +28,7 @@
 | 1.2 | 线程/内存随连接线性增长 | 建 512 连接，监测线程数与 RSS | 512 OS 线程可预估；断开后回收；无额外泄漏 | thread-per-connection | ✅ |
 | 1.3 | 重连风暴 / 抖动 | 反复 connect/disconnect（含异常断开） | 信号量 `release()` 每次执行，无"槽位泄漏" | `finish()` | ✅ |
 | 1.4 | 半开连接回收（reaper） | 建连后 TCP 静默 ≥300s | reaper 关闭连接并释放槽；检测延迟 ≤ `socket_timeout(120)+idle(300)` | idle reaper `server.py` | ✅ |
-| 1.5 | ⚠️ 慢滴流绕过 reaper（重点） | 每 <120s 发 1 字节，不发完整记录 | **已知缺陷验证**：`last_data_unix` 被刷新，reaper 永不触发 | reaper 只看"是否有字节" | ⚠️ |
+| 1.5 | ⚠️→✅ 慢滴流绕过 reaper（重点） | 每 <120s 发 1 字节，不发完整记录 | **已修复**：新增 `idle_no_record_sec`，按"是否产出完整记录"判空闲 | reaper 只看"是否有字节" | ✅ 已修复 |
 | 1.6 | backlog 溢出 | 瞬时 >128 个 SYN | 超 `request_queue_size=128` 的被内核处理，服务不崩 | `backlog=128` | ⬜ |
 | 1.7 | TCP keepalive 生效 | 模拟链路中断 | keepalive(60/30/5) 最终清理连接 | `set_socket_options` | ⬜ |
 
@@ -57,8 +57,8 @@
 
 | # | 测试项 | 场景 | 判定标准 | 风险点 | 状态 |
 |---|--------|------|---------|--------|------|
-| 4.1 | ⚠️ sha256 缓存内存增长（高危） | 长跑 + 大量设备/高频流，监测 RSS | `_sha256_cache[path]` 是全部历史 sha256 集合，单调增长→内存泄漏式 | `db.py` 无上限/无 LRU | ⚠️ |
-| 4.2 | ⚠️ `_locks`/`_seeded` dict 永不清理 | 制造大量不同 device_id | dict 按"见过设备数"单调增长，永不回收 | `db.py` `_lock_for` | ⚠️ |
+| 4.1 | ⚠️→✅ sha256 缓存内存增长（高危） | 长跑 + 大量设备/高频流，监测 RSS | **已修复**：`BoundedShaCache` LRU 封顶（默认 20000/流），seeding 仅读最近 N 条 | `db.py` 无上限/无 LRU | ✅ 已修复 |
+| 4.2 | ⚠️→✅ `_locks`/`_seeded` dict 永不清理 | 制造大量不同 device_id | **已修复**：按 `device_cache_ttl_sec` 惰性淘汰空闲设备条目 | `db.py` `_lock_for` | ✅ 已修复 |
 | 4.3 | 文件句柄泄漏 | 长跑，fd 计数 | 每包 open/close 后句柄稳定，异常路径不泄漏 | `finally: f.close()` | ⬜ |
 | 4.4 | 线程泄漏 | 长跑 + 大量短连接 | 线程数回落稳态，daemon worker 固定 | — | ⬜ |
 | 4.5 | 外部定时任务（告警/备份） | 高负载下触发 timer | 独立进程，不阻塞门户事件循环；备份 I/O 影响 | `stage2.py`/`tools/` | ⬜ |
@@ -67,11 +67,11 @@
 
 | # | 测试项 | 场景 | 判定标准 | 风险点 | 状态 |
 |---|--------|------|---------|--------|------|
-| 5.1 | ⚠️ 大导出打满线程池（高危） | 并发多个大窗口 `/export/download`（近 `max_records=200000`） | **已知瓶颈**：整段读入内存成单 `bytes`、无流式；几个并发即占满线程池→全站无响应 | `export_mseed_bytes` | ⚠️ |
-| 5.2 | ⚠️ 登录风暴 DoS（高危） | 高并发登录 | bcrypt(rounds=12) CPU 密集，`workers=1` 下吃满线程池→DoS | `security.py` bcrypt | ⚠️ |
+| 5.1 | ⚠️→✅ 大导出打满线程池（高危） | 并发多个大窗口 `/export/download`（近 `max_records=200000`） | **已修复**：改 `StreamingResponse` + `export_mseed_stream`（O(单条)内存）+ 并发导出闸门（超额 503） | `export_mseed_bytes` | ✅ 已修复 |
+| 5.2 | ⚠️→✅ 登录风暴 DoS（高危） | 高并发登录 | **已修复**：`login_guard` 失败限流/锁定 + bcrypt 并发闸门 | `security.py` bcrypt | ✅ 已修复 |
 | 5.3 | 大时间窗波形查询 | 并发 `/api/waveform` 大窗口 + 逻辑合并设备 | CPU/内存/HDF5 读重负载；`st.merge()`+下采样耗时 | `read_waveform(_multi)` | ⬜ |
 | 5.4 | 多设备 dashboard | 设备数数百，并发打开首页 | 每设备一次全文件扫描；响应时间 | `device_summary` | ⬜ |
-| 5.5 | SQLite 写锁争用 | 并发写 `app.db` | `connect()` 无显式 busy_timeout（隐式 5s），与 stage2 的 20s 不一致→5s~20s 持锁时 web 侧 `database is locked` | `app_db.connect()` | ⚠️ |
+| 5.5 | ⚠️→✅ SQLite 写锁争用 | 并发写 `app.db` | **已修复**：`app_db.connect()` 显式 `timeout=20` + `PRAGMA busy_timeout=20000`，与 stage2 对齐 | `app_db.connect()` | ✅ 已修复 |
 | 5.6 | 慢请求无超时 | 构造极慢导出/查询 | 当前无超时/无流式/无分页→慢请求长期占槽 | 多处 | ⬜ |
 | 5.7 | 会话安全默认值 | 检查部署配置 | `secret_key` 默认 `CHANGE_ME` 必须覆盖；`https_only` 生产复核 | `config.py`/SessionMiddleware | ⬜ |
 
@@ -114,16 +114,22 @@
 - **2.1 / 2.7**：单设备高速灌包使队列打满时，**0 丢包**，队列深度始终 ≤ maxsize；
   200 条 × 20ms 写延迟=4.06s，证实背压把发送方节流；优雅关闭在 deadline 内完成。
 
-### 已确认存在问题 ⚠️
+### 已修复并通过回归验证 ✅
 
-| 项 | 实测结论 | 影响 | 建议修复方向 |
-|----|---------|------|------------|
-| **1.5** 慢滴流绕过 reaper | 每 1.2s 发 1 字节的连接撑过 4× `idle_timeout` 仍不被回收 | 僵尸/慢连接长期占线程+信号量槽 | reaper 增加「最小有效吞吐」判据（如按完整记录数而非任意字节判空闲） |
-| **4.1** sha256 缓存无限增长（高危） | 单流 20 万条唯一记录 → set 占 **29.6 MB**（~155 B/条），永不清理 | 长跑高频流最终 OOM | 给 `_sha256_cache[path]` 加上限/LRU，或只缓存近期窗口 |
-| **4.2** per-device dict 无限增长 | 5 万设备 → `_locks`+`_sha256_cache`+`_seeded` 占 **43.5 MB**（~911 B/设备），永不回收 | 设备/端口 churn 下内存单调增长 | 对长期不活跃设备淘汰其 lock/缓存条目 |
-| **5.1** 大导出非流式（高危） | 单个 `max_records=200000` 导出在内存物化 **~203 MB**，`Response(content=blob)` 非流式 | 每个在途导出占大内存 + 1 个线程池槽 | 改 `StreamingResponse` 分块产出；加请求级超时 |
-| **5.1/5.2** 有限线程池排队（高危） | 同步 handler 填满池（8）后，1.5ms 的轻请求被拖到 448ms，**291× 放大** | `workers=1` 下大导出/bcrypt 登录可致全站排队、构成 DoS 面 | 慢路由改 async + 线程/进程隔离；登录加限流；适当增 workers |
-| **5.5** SQLite busy_timeout 不一致 | 持锁 7s 时 `app_db.connect()`（web）**`database is locked`**，而 `stage2.app_connect()`（timeout=20）成功 | 5s~20s 持锁窗口内 web 写失败 | `app_db.connect()` 显式设置与 stage2 一致的 `busy_timeout` |
+> 下列 5 处确认缺陷已在本分支修复，每处都有对应的回归测试断言修复生效（见各脚本）。
+
+| 项 | 原问题（实测） | 修复 | 回归验证 |
+|----|--------------|------|---------|
+| **1.5** 慢滴流绕过 reaper | 每 1.2s 发 1 字节的连接撑过 4× `idle_timeout` 仍不被回收 | `server.py` 新增 `idle_no_record_sec`（默认 600s）：按「是否产出完整记录」判空闲，不再只看字节；`config.py` 加配置项 | `test_02`：慢滴流被回收✅；合法低速设备不误杀✅ |
+| **4.1** sha256 缓存无限增长 | 单流 20 万条 → **29.6 MB**，永不清理 | `db.py` 引入 `BoundedShaCache`（LRU，默认 20000/流）；seeding 仅读最近 N 条；`config.py` 加 `sha256_cache_max_per_stream` | `test_04`：喂 10× cap 后仍封顶、heap 不随 N 增长；窗口内重传仍去重 |
+| **4.2** per-device dict 无限增长 | 5 万设备 → **43.5 MB**，永不回收 | `db.py` 按 `device_cache_ttl_sec`（默认 24h）惰性淘汰空闲设备的 lock/cache/seeded；`_seeded` 改按 path 分组使淘汰 O(1) | `test_04`：5 万设备运行后保留 10 活跃、淘汰 49990 空闲 |
+| **5.1** 大导出非流式 + 占池 | 单次 `max_records=200000` 物化 **~203 MB**，非流式 | `data_reader.export_mseed_stream` 生成器逐条 `yield`；`main.py` 路由改 `StreamingResponse` + 并发导出闸门（超额返回 503） | `test_06`：峰值内存 203MB→**0.002MB**；闸门拒绝超额 |
+| **5.2** 登录风暴 DoS | bcrypt(rounds=12) + `workers=1` 可被登录洪泛打满线程池 | 新增 `login_guard.py`：失败限流 + 临时锁定（bcrypt 前拦截）+ bcrypt 并发闸门；`main.py` 登录路由接入 | `test_07`：锁定/过期/成功重置/窗口滑动/并发闸门全部验证 |
+| **5.5** SQLite busy_timeout 不一致 | 持锁 7s 时 web 侧 `database is locked`，stage2 成功 | `app_db.connect()` 显式 `timeout=20` + `PRAGMA busy_timeout=20000`，与 stage2 对齐 | `test_05`：修复后连接器等到 7s 锁并成功 |
+
+> **修复均带配置开关**，默认值保守、可通过配置文件 / 环境变量调整
+> （`idle_no_record_sec`、`sha256_cache_max_per_stream`、`device_cache_ttl_sec`、
+> `MSEED_MAX_CONCURRENT_EXPORTS`、`MSEED_MAX_CONCURRENT_LOGINS`）。
 
 ### 待在真实部署环境补测（沙盒依赖缺失）
 

@@ -210,7 +210,10 @@ class MSeedRequestHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         cfg = self.server.config
         buffer = b""
-        last_data_unix = time.time()
+        now0 = time.time()
+        last_data_unix = now0        # last time ANY bytes arrived (for logging)
+        # last time a COMPLETE record was parsed; _process_buffer refreshes it.
+        self.last_record_unix = now0
 
         while True:
             try:
@@ -222,14 +225,29 @@ class MSeedRequestHandler(socketserver.BaseRequestHandler):
                 # a FIN/RST). Reap it so the semaphore slot is freed and the
                 # instrument can establish a fresh, data-carrying session; leaving
                 # it open would loop here forever and keep real-time data stalled.
+                now = time.time()
                 idle = cfg.server.idle_timeout_sec
-                if idle and (time.time() - last_data_unix) >= idle:
+                if idle and (now - last_data_unix) >= idle:
                     LOG.warning(
                         "idle timeout: no data from %s:%s for %.0fs; closing half-open connection",
-                        self.client_ip, self.client_port, time.time() - last_data_unix,
+                        self.client_ip, self.client_port, now - last_data_unix,
                     )
                     if buffer:
                         self._quarantine(buffer, "idle_timeout_partial_buffer")
+                    break
+                # Slow-trickle guard: a peer may dribble bytes often enough to
+                # keep last_data_unix fresh yet never deliver a full record.
+                # Close it once it has produced no complete record for
+                # idle_no_record_sec, so it stops holding a slot for nothing.
+                no_rec = cfg.server.idle_no_record_sec
+                if no_rec and (now - self.last_record_unix) >= no_rec:
+                    LOG.warning(
+                        "no-record timeout: no complete record from %s:%s for %.0fs "
+                        "(received %d bytes); closing slow/stuck connection",
+                        self.client_ip, self.client_port, now - last_record_unix, self.byte_count,
+                    )
+                    if buffer:
+                        self._quarantine(buffer, "no_record_timeout_partial_buffer")
                     break
                 continue
             except ConnectionResetError:
@@ -329,6 +347,8 @@ class MSeedRequestHandler(socketserver.BaseRequestHandler):
                 LOG.warning("miniSEED receiver is stopping; discarded unfinished input peer=%s:%s", self.client_ip, self.client_port)
                 return buffer
             self.packet_count += 1
+            # Refresh the no-record idle clock: a complete record was produced.
+            self.last_record_unix = time.time()
 
         return buffer
 

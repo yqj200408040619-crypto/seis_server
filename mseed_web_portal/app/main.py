@@ -14,6 +14,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import app_db
+from .login_guard import login_throttle as _login_throttle, bcrypt_gate as _bcrypt_gate
 from .config import DEFAULT_CONFIG_PATH, load_settings
 from .data_reader import (
     device_summary,
@@ -39,6 +40,16 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("mseed_web_portal")
+
+# Bound the number of concurrent large exports. Each export occupies a worker
+# thread for its whole duration (uvicorn --workers 1 shares one AnyIO thread
+# pool), so a handful of big exports could otherwise starve every other route.
+# The gate rejects excess exports fast with HTTP 503 instead of letting them
+# pile up and block the pool. Tune via MSEED_MAX_CONCURRENT_EXPORTS.
+import threading as _threading
+
+_MAX_CONCURRENT_EXPORTS = int(os.environ.get("MSEED_MAX_CONCURRENT_EXPORTS", "2"))
+_export_gate = _threading.Semaphore(_MAX_CONCURRENT_EXPORTS)
 
 def _device_file_set(d) -> list[str]:
     """Resolve the full set of HDF5 files backing a logical device.
@@ -172,8 +183,37 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     client_ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() \
         or (request.client.host if request.client else "?")
     uname = username.strip()
-    result = app_db.authenticate_user(settings.app_db, uname, password)
+
+    # Throttle BEFORE running bcrypt: repeated failures are rejected without
+    # spending CPU, so a login flood cannot keep the thread pool busy hashing.
+    if _login_throttle.is_locked(client_ip, uname):
+        retry = int(_login_throttle.retry_after(client_ip, uname)) + 1
+        log.warning("login throttled: user=%r ip=%s retry_after=%ss", uname, client_ip, retry)
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            template_context(request, error="Too many attempts. Please try again later."),
+            status_code=429,
+            headers={"Retry-After": str(retry)},
+        )
+
+    # Limit concurrent bcrypt verifications so a burst can't saturate the pool.
+    if not _bcrypt_gate.acquire(timeout=5.0):
+        log.warning("login rejected (auth capacity): user=%r ip=%s", uname, client_ip)
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            template_context(request, error="Server busy. Please try again shortly."),
+            status_code=503,
+            headers={"Retry-After": "2"},
+        )
+    try:
+        result = app_db.authenticate_user(settings.app_db, uname, password)
+    finally:
+        _bcrypt_gate.release()
+
     if not result.ok:
+        _login_throttle.record_failure(client_ip, uname)
         log.warning(
             "login failed: user=%r ip=%s reason=%s",
             uname, client_ip, result.reason,
@@ -184,6 +224,7 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
             template_context(request, error="Invalid username or password."),
             status_code=401
         )
+    _login_throttle.record_success(client_ip, uname)
     log.info(
         "login success: user=%r id=%s role=%s ip=%s",
         uname, result.user["id"], result.user["role"], client_ip,
@@ -530,8 +571,8 @@ def export_download(
     end: str = Query(...),
     user: dict[str, Any] = Depends(current_user),
 ):
-    from fastapi.responses import Response
-    from .data_reader import export_mseed_bytes as _export_mseed_bytes
+    from fastapi.responses import StreamingResponse
+    from .data_reader import export_mseed_stream as _export_mseed_stream
     d = app_db.get_device_for_user(settings.app_db, device_id, int(user["id"]), admin=is_admin(user))
     if not d:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -539,24 +580,41 @@ def export_download(
     start_unix = parse_datetime_or_unix(start)
     end_unix = parse_datetime_or_unix(end)
     safe_path = safe_receiver_db_path(settings.receiver_db_dir, d["db_path"])
-    blob, record_count = _export_mseed_bytes(
-        safe_path,
-        device_key=d["device_key"],
-        components=comps or None,
-        start_unix=start_unix,
-        end_unix=end_unix,
-        max_records=200000,
-    )
-    if not blob:
-        raise HTTPException(status_code=404, detail="No records found in the requested range")
+
+    # Admission control: refuse (don't queue) when too many exports are running.
+    if not _export_gate.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Server busy with other exports; please retry shortly")
+
     comp_part = "ALL" if not comps else "-".join(comps)
     serial = d.get("device_key") if hasattr(d, "get") else d["device_key"]
     filename = f"{serial}_{comp_part}_{int(start_unix)}_{int(end_unix)}.mseed"
+
+    def _streamer():
+        # Stream record-by-record so peak memory is O(one record), not O(whole
+        # export). The gate is released when the generator is exhausted or the
+        # client disconnects (StreamingResponse closes the generator).
+        try:
+            yielded = False
+            for chunk in _export_mseed_stream(
+                safe_path,
+                device_key=d["device_key"],
+                components=comps or None,
+                start_unix=start_unix,
+                end_unix=end_unix,
+                max_records=200000,
+            ):
+                if chunk:
+                    yielded = True
+                    yield chunk
+            if not yielded:
+                log.info("export produced no records device=%s range=%s..%s", device_id, start_unix, end_unix)
+        finally:
+            _export_gate.release()
+
     headers = {
         "Content-Disposition": f'attachment; filename="{filename}"',
-        "X-miniSEED-Record-Count": str(record_count),
     }
-    return Response(content=blob, media_type="application/vnd.fdsn.mseed", headers=headers)
+    return StreamingResponse(_streamer(), media_type="application/vnd.fdsn.mseed", headers=headers)
 
 
 @app.get("/export/obn-raw-download")

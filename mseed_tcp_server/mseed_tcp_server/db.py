@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -32,6 +33,43 @@ class InsertResult:
     gap_events: list[str]
 
 
+class BoundedShaCache:
+    """An LRU set of sha256 strings with an optional size cap.
+
+    The receiver only needs to dedup the *recent* retransmits that follow a
+    reconnect/restart, not a stream's entire history, so the full-history set
+    that this replaces grew without bound (~155 B per unique record). This keeps
+    at most ``max_size`` most-recently-touched hashes; older ones are evicted.
+    ``max_size == 0`` disables the bound (keeps every entry, legacy behaviour).
+    All access is under the owning per-file lock, so no internal lock is needed.
+    """
+
+    __slots__ = ("_od", "max_size")
+
+    def __init__(self, max_size: int):
+        self._od: "OrderedDict[str, None]" = OrderedDict()
+        self.max_size = max(0, int(max_size))
+
+    def __contains__(self, sha: str) -> bool:
+        if sha in self._od:
+            self._od.move_to_end(sha)  # refresh recency on hit
+            return True
+        return False
+
+    def add(self, sha: str) -> None:
+        if not sha:
+            return
+        if sha in self._od:
+            self._od.move_to_end(sha)
+            return
+        self._od[sha] = None
+        if self.max_size and len(self._od) > self.max_size:
+            self._od.popitem(last=False)  # evict oldest
+
+    def __len__(self) -> int:
+        return len(self._od)
+
+
 class DeviceDatabaseManager:
     """One HDF5 file per MiniSEED device, compatible with mseed-web-portal."""
 
@@ -41,7 +79,13 @@ class DeviceDatabaseManager:
         self.h5_root.mkdir(parents=True, exist_ok=True)
         self._locks_guard = threading.Lock()
         self._locks: dict[Path, threading.Lock] = {}
-        self._sha256_cache: dict[Path, set[str]] = {}
+        self._sha256_cache: dict[Path, BoundedShaCache] = {}
+        # Last time each device-file was written, used to prune idle entries so
+        # the maps below do not grow with every device ever seen.
+        self._last_active: dict[Path, float] = {}
+        self._sha_cap = int(config.storage.sha256_cache_max_per_stream)
+        self._device_ttl = int(config.storage.device_cache_ttl_sec)
+        self._last_prune = time.time()
         # Files are opened in plain append mode per write and closed again
         # immediately (see _open_for_write). SWMR write mode is intentionally
         # NOT used: the receiver mutates file structure (new groups, attrs and
@@ -50,13 +94,50 @@ class DeviceDatabaseManager:
         # _files stays empty under normal operation; close()/_evict_handle keep
         # it only as a safety net for any stray cached handle.
         self._files: dict[Path, h5py.File] = {}
-        # Tracks (path, stream) pairs whose sha256 cache has been seeded from the
-        # on-disk rolling index, so we only pay that scan once per stream.
-        self._seeded: set[tuple[Path, str]] = set()
+        # Tracks, per device-file, which stream keys have had their sha256 cache
+        # seeded from the on-disk rolling index, so we only pay that scan once
+        # per stream. Keyed by path so pruning a device is O(1), not O(all
+        # streams ever seen).
+        self._seeded: dict[Path, set[str]] = {}
 
     def _lock_for(self, path: Path) -> threading.Lock:
         with self._locks_guard:
             return self._locks.setdefault(path, threading.Lock())
+
+    def _prune_idle_devices(self, now: float) -> None:
+        """Drop in-memory lock/cache/seeded entries for long-idle device files.
+
+        Without this, _locks / _sha256_cache / _seeded / _last_active grow
+        monotonically with the number of distinct device files ever seen (e.g.
+        client_ip/port churn) and are never reclaimed. Throttled so the scan
+        runs at most once a minute, never on the per-packet hot path in full.
+        Only prunes a file whose lock is not currently held, so an in-flight
+        write is never disturbed; a pruned device simply reseeds on its next
+        packet. Must NOT be called while holding a per-file lock.
+        """
+        ttl = self._device_ttl
+        if not ttl:
+            return
+        if now - self._last_prune < 60.0:
+            return
+        with self._locks_guard:
+            self._last_prune = now
+            stale = [p for p, ts in self._last_active.items() if now - ts > ttl]
+            for path in stale:
+                lock = self._locks.get(path)
+                # Skip if a write currently holds this file's lock.
+                if lock is not None and not lock.acquire(blocking=False):
+                    continue
+                try:
+                    self._locks.pop(path, None)
+                    self._sha256_cache.pop(path, None)
+                    self._last_active.pop(path, None)
+                    self._seeded.pop(path, None)
+                finally:
+                    if lock is not None:
+                        lock.release()
+            if stale:
+                LOG.info("pruned %d idle device cache entries (ttl=%ss)", len(stale), ttl)
 
     @staticmethod
     def _clean(value: str | None, default: str = "") -> str:
@@ -263,8 +344,12 @@ class DeviceDatabaseManager:
         device_id = self.device_id(client, header)
         path = self.db_path(device_id)
         keys = self._keys(header)
+        # Opportunistically reclaim memory for devices that have gone idle.
+        # Throttled internally; safe to call outside the per-file lock.
+        self._prune_idle_devices(time.time())
         with self._lock_for(path):
-            cache = self._sha256_cache.setdefault(path, set())
+            self._last_active[path] = time.time()
+            cache = self._sha256_cache.setdefault(path, BoundedShaCache(self._sha_cap))
             if header.sha256 in cache:
                 return InsertResult(path, device_id, False, True, [])
             try:
@@ -305,16 +390,24 @@ class DeviceDatabaseManager:
             # of probing for a dataset name.  Seed the cache from the rolling
             # index on first touch so retransmits after a receiver restart are
             # still recognised and neither re-stored nor flagged as gaps.
-            if "index" in grp and (path, stream) not in self._seeded:
+            if "index" in grp and stream not in self._seeded.get(path, ()):
                 try:
-                    shas = grp["index"]["sha256"]
+                    # Only seed the most recent entries. Dedup exists to catch
+                    # retransmits right after a reconnect, so a bounded recent
+                    # window is sufficient; reading the whole history here would
+                    # defeat the bounded cache and reload megabytes on first
+                    # touch of a long-lived stream.
+                    sha_ds = grp["index"]["sha256"]
+                    n = len(sha_ds)
+                    seed_n = n if self._sha_cap <= 0 else min(n, self._sha_cap)
+                    shas = sha_ds[n - seed_n:] if seed_n else sha_ds[:0]
                     for s in shas:
                         sv = s.decode("ascii", "replace").rstrip("\x00") if isinstance(s, (bytes, np.bytes_)) else str(s)
                         if sv:
                             cache.add(sv)
                 except Exception:
                     pass
-                self._seeded.add((path, stream))
+                self._seeded.setdefault(path, set()).add(stream)
             if header.sha256 in cache:
                 return InsertResult(path, device_id, False, True, [])
             last_seq, last_start, last_end = int(grp.attrs["last_seq"]), float(grp.attrs["last_start"]), float(grp.attrs["last_end"])

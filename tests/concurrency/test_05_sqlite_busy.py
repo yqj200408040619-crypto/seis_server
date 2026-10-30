@@ -25,10 +25,20 @@ DB = os.path.join(tempfile.mkdtemp(prefix="seis_sqlite_"), "app.db")
 
 
 def connect_app_db_style(path):
-    # EXACTLY mirrors app_db.connect(): no busy_timeout
+    # Mirrors the ORIGINAL app_db.connect(): no explicit busy_timeout (relies
+    # on Python's implicit 5s default). Kept to document the pre-fix behaviour.
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def connect_app_db_fixed(path):
+    # Mirrors the FIXED app_db.connect(): explicit timeout=20 + busy_timeout.
+    conn = sqlite3.connect(path, timeout=20)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=20000")
     return conn
 
 
@@ -102,6 +112,10 @@ def main():
     print(f"  stage2.app_connect() style (explicit timeout=20):")
     print(f"    success={r_stage2['ok']}  waited={r_stage2['waited']:.3f}s  error={r_stage2['err']}")
 
+    r_fixed = try_write(connect_app_db_fixed, "web_request", hold_sec=7.0)
+    print(f"  FIXED app_db.connect() style (timeout=20 + busy_timeout):")
+    print(f"    success={r_fixed['ok']}  waited={r_fixed['waited']:.3f}s  error={r_fixed['err']}")
+
     # Corrected expectation: Python's sqlite3 gives app_db.connect() an IMPLICIT
     # 5s timeout, so it is NOT a 0s fast-fail. The real hazard is the
     # INCONSISTENCY: when a writer holds the lock between 5s and 20s, the web
@@ -110,23 +124,28 @@ def main():
     app_failed = (not r_app["ok"]) and r_app["err"] and "locked" in r_app["err"]
     stage2_ok = r_stage2["ok"]
 
+    fixed_ok = r_fixed["ok"] and r_fixed["waited"] >= 6.5
+
     print("\n--- summary ---")
     if app_failed and stage2_ok:
-        print("5.5 CONFIRMED (inconsistency): with a 5s<hold<20s lock, app_db.connect()")
-        print("    raises 'database is locked' while stage2.app_connect() succeeds.")
-        print("    Root cause: app_db.connect() sets no explicit busy_timeout and")
-        print("    relies on the implicit 5s default; stage2 uses 20s. They disagree.")
-        verdict = True
+        print("5.5 CONFIRMED (inconsistency): with a 5s<hold<20s lock, the ORIGINAL")
+        print("    app_db.connect() raises 'database is locked' while stage2 succeeds.")
+        print("    Root cause: original app_db.connect() relied on the implicit 5s")
+        print("    default; stage2 uses 20s. They disagreed.")
     elif r_app["ok"] and stage2_ok:
-        print("5.5 PARTIAL: both succeeded here (hold<implicit timeout on this build).")
-        print("    Still a latent risk — app_db.connect() has no EXPLICIT busy_timeout,")
-        print("    so its tolerance is an undocumented 5s default that differs from")
-        print("    stage2's explicit 20s. Recommend setting an explicit busy_timeout.")
-        verdict = True
-    else:
-        print(f"5.5 unexpected: app ok={r_app['ok']} err={r_app['err']} / stage2 ok={stage2_ok}")
-        verdict = False
+        print("5.5 pre-fix behaviour not reproduced as fast-fail on this build.")
 
+    if fixed_ok:
+        print("5.5 FIX VERIFIED: patched app_db.connect() (timeout=20 + busy_timeout)")
+        print(f"    waited {r_fixed['waited']:.2f}s for the 7s lock and SUCCEEDED, "
+              "matching stage2.")
+    else:
+        print(f"5.5 FIX NOT VERIFIED: fixed ok={r_fixed['ok']} waited={r_fixed['waited']:.2f}s "
+              f"err={r_fixed['err']}")
+
+    # The regression test now asserts the FIX: the patched connector must wait
+    # out the 7s lock and succeed, consistently with stage2.
+    verdict = fixed_ok and stage2_ok
     return 0 if verdict else 1
 
 

@@ -780,6 +780,77 @@ def export_mseed_bytes(
     return buf.getvalue(), count
 
 
+def export_mseed_stream(
+    db_path: str,
+    *,
+    device_key: str,
+    components: list[str] | None,
+    start_unix: float,
+    end_unix: float,
+    max_records: int = 200000,
+):
+    """Yield exported miniSEED bytes incrementally instead of one big blob.
+
+    ``export_mseed_bytes`` materialises the entire export in memory
+    (``b"".join(...)`` or ``st.write(buf)``), so a large time window can hold
+    hundreds of MB resident while occupying a worker thread, and several
+    concurrent exports can exhaust memory and the thread pool.
+
+    For modern receiver files every stored record keeps its exact original TCP
+    bytes (``raw``), so we can stream those out record-by-record with O(1)
+    memory. Only when a file has legacy records that must be re-encoded through
+    obspy do we fall back to the buffered path for the remainder (rare, and
+    bounded by ``max_records``). Yields ``bytes`` chunks; yields nothing when
+    there is no data in range.
+    """
+    if is_obn_h5(db_path):
+        return
+    if end_unix <= start_unix:
+        raise ValueError("End time must be greater than start time")
+
+    legacy_traces = Stream()
+    count = 0
+    with open_h5_read(db_path) as f:
+        for stream_key in f.keys():
+            if count >= max_records:
+                break
+            grp = f[stream_key]
+            if not isinstance(grp, h5py.Group):
+                continue
+            if components and stream_key.rsplit(".", 1)[-1] not in components:
+                continue
+            for wf, raw, meta in _iter_stream_records(grp, stream_key, start_unix, end_unix, max_records - count):
+                if count >= max_records:
+                    break
+                if raw:
+                    try:
+                        read(BytesIO(raw), format="MSEED", headonly=True)
+                    except Exception:
+                        pass
+                    else:
+                        count += 1
+                        yield raw          # stream the exact record, O(1) memory
+                        continue
+                # Legacy record without usable raw bytes: must be re-encoded via
+                # obspy. Collect only these; they are the uncommon case.
+                data = np.asarray(wf)
+                tr = Trace(data=data)
+                tr.stats.network = meta["network"]
+                tr.stats.station = meta["station"]
+                tr.stats.location = meta["location"]
+                tr.stats.channel = meta["channel"]
+                tr.stats.sampling_rate = meta["sampling_rate"] or 1.0
+                tr.stats.starttime = UTCDateTime(meta["start_unix"])
+                legacy_traces.append(tr)
+                count += 1
+
+    # Flush any re-encoded legacy traces as a trailing chunk.
+    if len(legacy_traces) > 0:
+        buf = BytesIO()
+        legacy_traces.write(buf, format="MSEED")
+        yield buf.getvalue()
+
+
 def export_latest_window_stage3(db_path: str, *, device_key: str, minutes: int = 30) -> dict[str, Any]:
     summary = device_summary(db_path, device_key)
     last = summary.get("last_start")

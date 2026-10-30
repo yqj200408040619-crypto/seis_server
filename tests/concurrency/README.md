@@ -34,11 +34,14 @@ for t in test_0*.py; do python3 "$t"; done
 | 脚本 | 覆盖项 | 结论 |
 |------|--------|------|
 | `test_01_connection_limit.py` | 1.1 连接上限 / 1.2 线程增长 / 1.3 信号量释放 | ✅ 符合预期 |
-| `test_02_idle_reaper.py` | 1.4 reaper 回收 / 1.5 慢滴流绕过 | 1.4 ✅；**1.5 ⚠️ 确认缺陷** |
+| `test_02_idle_reaper.py` | 1.4 reaper 回收 / 1.5 慢滴流绕过 | 1.4 ✅；**1.5 ✅ 已修复并验证**（`idle_no_record_sec`）|
 | `test_03_write_backpressure.py` | 2.1 写队列背压 / 2.7 优雅 drain | ✅ 符合预期 |
-| `test_04_cache_growth.py` | 4.1 sha256 缓存增长 / 4.2 per-device dict 增长 | **⚠️ 两项均确认（内存无限增长）** |
-| `test_05_sqlite_busy.py` | 5.5 SQLite 写锁 busy_timeout | **⚠️ 确认不一致缺陷** |
-| `test_06_portal_blocking.py` | 5.1 大导出内存/非流式 / 5.2 线程池排队 | **⚠️ 确认瓶颈** |
+| `test_04_cache_growth.py` | 4.1 sha256 缓存增长 / 4.2 per-device dict 增长 | **✅ 已修复并验证**（LRU 封顶 + TTL 淘汰）|
+| `test_05_sqlite_busy.py` | 5.5 SQLite 写锁 busy_timeout | **✅ 已修复并验证**（显式 timeout=20）|
+| `test_06_portal_blocking.py` | 5.1 大导出内存/非流式 + 导出闸门 / 线程池排队 | **✅ 已修复并验证**（流式 + 闸门）|
+| `test_07_login_guard.py` | 5.2 登录限流 + bcrypt 并发闸门 | **✅ 已修复并验证** |
+
+所有脚本现在断言的是**修复后的预期行为**（而非仅复现缺陷），7/7 通过。
 
 ## 未能在沙盒中执行的项（需在真实部署环境补测）
 
