@@ -123,7 +123,7 @@
 | **1.5** 慢滴流绕过 reaper | 每 1.2s 发 1 字节的连接撑过 4× `idle_timeout` 仍不被回收 | `server.py` 新增 `idle_no_record_sec`（默认 600s）：按「是否产出完整记录」判空闲，不再只看字节；`config.py` 加配置项 | `test_02`：慢滴流被回收✅；合法低速设备不误杀✅ |
 | **4.1** sha256 缓存无限增长 | 单流 20 万条 → **29.6 MB**，永不清理 | `db.py` 引入 `BoundedShaCache`（LRU，默认 20000/流）；seeding 仅读最近 N 条；`config.py` 加 `sha256_cache_max_per_stream` | `test_04`：喂 10× cap 后仍封顶、heap 不随 N 增长；窗口内重传仍去重 |
 | **4.2** per-device dict 无限增长 | 5 万设备 → **43.5 MB**，永不回收 | `db.py` 按 `device_cache_ttl_sec`（默认 24h）惰性淘汰空闲设备的 lock/cache/seeded；`_seeded` 改按 path 分组使淘汰 O(1) | `test_04`：5 万设备运行后保留 10 活跃、淘汰 49990 空闲 |
-| **5.1** 大导出非流式 + 占池 | 单次 `max_records=200000` 物化 **~203 MB**，非流式 | `data_reader.export_mseed_stream` 生成器逐条 `yield`；`main.py` 路由改 `StreamingResponse` + 并发导出闸门（超额返回 503） | `test_06`：峰值内存 203MB→**0.002MB**；闸门拒绝超额 |
+| **5.1** 大导出非流式 + 占池 | 单次 `max_records=200000` 物化 **~203 MB**，非流式 | `data_reader.export_mseed_stream` 生成器逐条 `yield`；**legacy 重编码路径也按 `legacy_flush_every` 批量 flush**（全 legacy 文件也保持 O(batch)）；`main.py` 路由改 `StreamingResponse` + 并发导出闸门（超额返回 503） | `test_06`：raw 路径 203MB→**0.002MB**；legacy 分批 5k/50k 条均 ~0.25MB；闸门拒绝超额 |
 | **5.2** 登录风暴 DoS | bcrypt(rounds=12) + `workers=1` 可被登录洪泛打满线程池 | 新增 `login_guard.py`：失败限流 + 临时锁定（bcrypt 前拦截）+ bcrypt 并发闸门；`main.py` 登录路由接入 | `test_07`：锁定/过期/成功重置/窗口滑动/并发闸门全部验证 |
 | **5.5** SQLite busy_timeout 不一致 | 持锁 7s 时 web 侧 `database is locked`，stage2 成功 | `app_db.connect()` 显式 `timeout=20` + `PRAGMA busy_timeout=20000`，与 stage2 对齐 | `test_05`：修复后连接器等到 7s 锁并成功 |
 
@@ -133,7 +133,13 @@
 
 ### 待在真实部署环境补测（沙盒依赖缺失）
 
-- **3.1** HDF5 读写并发一致性（`locking=False`）、**3.2** 超大文件 `index[:]` 读延迟、
-  **2.3/2.4** 每包 open/flush/close 吞吐与 gzip CPU —— 需 `h5py`/`obspy`。
-- **5.3/5.4** 真实接口压测、**5.2** bcrypt 实际耗时 —— 需 `fastapi`/`uvicorn`/`bcrypt`。
-- **1.6/1.7**、**3.4** OBN 接收器、**6.x** 故障注入 —— 建议预发布环境执行。
+下列项需 `h5py`/`obspy`/`fastapi`/`bcrypt`，无法在 `INTEGRATIONS_ONLY` 沙盒执行。已
+提供一键端到端压测套件 [`tests/loadtest/`](tests/loadtest/)（见其 README），在装好依赖
+的 staging/venv 里运行 `python tests/loadtest/run_e2e.py` 即可覆盖：
+
+- **1.1/1.4/1.5**（连接并发、reaper、慢滴流）、**2.1**（背压）、**3.x**（大文件）
+  —— 由 `loadtest_tcp.py` 并发灌真实 miniSEED 覆盖。
+- **4.1/4.2**（内存平稳性）—— 长时间灌包后观察接收端 RSS 曲线。
+- **5.1**（流式导出 + 闸门）、**5.2**（登录洪泛限流/bcrypt 实际耗时）、**5.3/5.4**
+  （波形查询/多设备）—— 由 `loadtest_portal.py` 的 login/export/waveform/mixed 场景覆盖。
+- **1.6/1.7**、**3.4** OBN 接收器、**6.x** 故障注入 —— 建议在预发布环境手动执行。

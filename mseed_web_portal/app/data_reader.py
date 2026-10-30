@@ -788,6 +788,7 @@ def export_mseed_stream(
     start_unix: float,
     end_unix: float,
     max_records: int = 200000,
+    legacy_flush_every: int = 500,
 ):
     """Yield exported miniSEED bytes incrementally instead of one big blob.
 
@@ -797,18 +798,31 @@ def export_mseed_stream(
     concurrent exports can exhaust memory and the thread pool.
 
     For modern receiver files every stored record keeps its exact original TCP
-    bytes (``raw``), so we can stream those out record-by-record with O(1)
-    memory. Only when a file has legacy records that must be re-encoded through
-    obspy do we fall back to the buffered path for the remainder (rare, and
-    bounded by ``max_records``). Yields ``bytes`` chunks; yields nothing when
-    there is no data in range.
+    bytes (``raw``), so we stream those out record-by-record with O(1) memory.
+    Legacy records that have no usable raw bytes must be re-encoded through
+    obspy; rather than buffering the whole run, we re-encode them in small
+    batches of ``legacy_flush_every`` traces and yield each batch, so even a
+    file that is entirely legacy stays O(batch) in memory. miniSEED is a
+    concatenation of self-describing fixed-length records, so emitting multiple
+    written blocks back-to-back yields a valid stream. Yields ``bytes`` chunks;
+    yields nothing when there is no data in range.
     """
     if is_obn_h5(db_path):
         return
     if end_unix <= start_unix:
         raise ValueError("End time must be greater than start time")
 
-    legacy_traces = Stream()
+    legacy_batch = Stream()
+    flush_every = max(1, int(legacy_flush_every))
+
+    def _flush_legacy() -> bytes | None:
+        if len(legacy_batch) == 0:
+            return None
+        buf = BytesIO()
+        legacy_batch.write(buf, format="MSEED")
+        legacy_batch.clear()
+        return buf.getvalue()
+
     count = 0
     with open_h5_read(db_path) as f:
         for stream_key in f.keys():
@@ -832,7 +846,7 @@ def export_mseed_stream(
                         yield raw          # stream the exact record, O(1) memory
                         continue
                 # Legacy record without usable raw bytes: must be re-encoded via
-                # obspy. Collect only these; they are the uncommon case.
+                # obspy. Buffer only a small batch, then flush and release it.
                 data = np.asarray(wf)
                 tr = Trace(data=data)
                 tr.stats.network = meta["network"]
@@ -841,14 +855,17 @@ def export_mseed_stream(
                 tr.stats.channel = meta["channel"]
                 tr.stats.sampling_rate = meta["sampling_rate"] or 1.0
                 tr.stats.starttime = UTCDateTime(meta["start_unix"])
-                legacy_traces.append(tr)
+                legacy_batch.append(tr)
                 count += 1
+                if len(legacy_batch) >= flush_every:
+                    chunk = _flush_legacy()
+                    if chunk:
+                        yield chunk
 
-    # Flush any re-encoded legacy traces as a trailing chunk.
-    if len(legacy_traces) > 0:
-        buf = BytesIO()
-        legacy_traces.write(buf, format="MSEED")
-        yield buf.getvalue()
+    # Flush any remaining re-encoded legacy traces.
+    tail = _flush_legacy()
+    if tail:
+        yield tail
 
 
 def export_latest_window_stage3(db_path: str, *, device_key: str, minutes: int = 30) -> dict[str, Any]:

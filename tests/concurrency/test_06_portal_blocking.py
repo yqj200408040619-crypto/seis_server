@@ -82,7 +82,43 @@ def part_a_streaming_vs_blob():
     print(f"      streamed {mb(bytes_out):.1f} MB with ~constant memory")
     streaming_wins = new_peak < old_peak / 10      # at least 10x lower peak
     print(f"      streaming reduces peak memory by >10x = {streaming_wins}")
-    return streaming_wins
+
+    # --- legacy re-encode path: batched flush keeps memory O(batch) ---
+    # Models export_mseed_stream's legacy branch: buffer up to flush_every
+    # "traces" (here, byte buffers), emit, then clear. Peak must track the
+    # batch size, NOT the total number of legacy records.
+    FLUSH_EVERY = 500
+    legacy_batch = []
+
+    def legacy_stream(total, rec_size):
+        buffered = 0
+        for _ in range(total):
+            legacy_batch.append(b"\x00" * rec_size)   # stand-in for a Trace
+            buffered += 1
+            if len(legacy_batch) >= FLUSH_EVERY:
+                out = b"".join(legacy_batch)            # stand-in for st.write()
+                legacy_batch.clear()
+                yield out
+        if legacy_batch:
+            yield b"".join(legacy_batch)
+            legacy_batch.clear()
+
+    tracemalloc.start()
+    base = tracemalloc.take_snapshot()
+    for total in (5_000, 50_000):                      # 10x more legacy records
+        for _ in legacy_stream(total, RECORD_SIZE):
+            snap_leg = tracemalloc.take_snapshot()
+        peak = sum(s.size_diff for s in snap_leg.compare_to(base, "filename"))
+        if total == 5_000:
+            peak_5k = peak
+        else:
+            peak_50k = peak
+    tracemalloc.stop()
+    legacy_bounded = peak_50k <= peak_5k * 2           # ~flat despite 10x records
+    print(f"      legacy batched flush: peak@5k={mb(peak_5k):.3f}MB "
+          f"peak@50k={mb(peak_50k):.3f}MB  bounded-by-batch={legacy_bounded}")
+
+    return streaming_wins and legacy_bounded
 
 
 # ------------------------------------------------------------------ Part B
