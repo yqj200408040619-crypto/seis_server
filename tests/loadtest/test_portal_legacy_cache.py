@@ -13,7 +13,8 @@ caches it, keyed on file inode + group member count. This test checks:
   1. cached results equal an uncached scan (count, last_start, one-hour count,
      waveform/export record selection);
   2. N concurrent callers trigger exactly ONE build per stream;
-  3. adding a dataset to the group invalidates the cache.
+  3. adding a dataset to the group invalidates the cache;
+  4. a fresh process reuses the on-disk copy instead of rescanning.
 
 Run with the portal interpreter, e.g.:
     /opt/mseed-web-portal/.venv/bin/python tests/loadtest/test_portal_legacy_cache.py
@@ -38,6 +39,10 @@ def main() -> int:
         print(f"ERROR: needs h5py/numpy ({exc}); run with the portal venv. Not pretending to pass.")
         return 2
     os.environ.setdefault("MSEED_WEB_CONFIG", os.devnull)
+    work = tempfile.mkdtemp(prefix="portal_legacy_cache_")
+    disk_dir = os.path.join(work, "disk_cache")
+    os.makedirs(disk_dir)
+    os.environ["MSEED_LEGACY_CACHE_DIR"] = disk_dir
     sys.path.insert(0, PORTAL)
     try:
         from app import data_reader as dr
@@ -45,7 +50,6 @@ def main() -> int:
         print(f"ERROR: cannot import portal data_reader ({exc}). Not pretending to pass.")
         return 2
 
-    work = tempfile.mkdtemp(prefix="portal_legacy_cache_")
     path = os.path.join(work, "127.0.0.1_18000_SS_TEST.h5")
     now = time.time()
     n = 3000
@@ -59,6 +63,9 @@ def main() -> int:
                 d.attrs["end_unix"] = s + 0.5
                 d.attrs["recv_unix"] = s
                 d.attrs["sampling_rate"] = 20.0
+
+    def strip(s):
+        return (s["components"], s["total_packets"], s["last_start"], s["one_hour_packets"])
 
     # Count builds by wrapping the builder.
     builds = {"n": 0}
@@ -89,8 +96,10 @@ def main() -> int:
     eq_window = len(got) == 50 and abs(got[0][2]["start_unix"] - (now - 7200 + 100)) < 1e-6
     print(f"[1] equality: count={eq_count} last_start={eq_last} one_hour={eq_hour} window={eq_window}")
 
-    # 2) single-flight under concurrency
+    # 2) single-flight under concurrency (memory and disk cache both empty)
     dr._LEGACY_CACHE.clear(); builds["n"] = 0
+    for x in os.listdir(disk_dir):
+        os.unlink(os.path.join(disk_dir, x))
     ts = [threading.Thread(target=dr.device_summary, args=(path, None)) for _ in range(16)]
     [t.start() for t in ts]; [t.join() for t in ts]
     single = builds["n"] == 3  # one build per stream, not 16 x 3
@@ -106,10 +115,17 @@ def main() -> int:
     invalidated = c2["packets"] == n + 1 and builds["n"] == 1
     print(f"[3] after adding a dataset: packets={c2['packets']} rebuilds={builds['n']} invalidated={invalidated}")
 
+    # 4) disk cache: a fresh process (memory cache empty) must not rebuild
+    dr._LEGACY_CACHE.clear(); builds["n"] = 0
+    s3 = dr.device_summary(path, None)
+    disk_files = len([x for x in os.listdir(disk_dir) if x.endswith(".npz")])
+    disk_hit = builds["n"] == 0 and strip(s3) == strip(s2) and disk_files == 3
+    print(f"[4] fresh memory cache -> rebuilds={builds['n']} disk_files={disk_files} disk_hit={disk_hit}")
+
     dr._build_legacy_meta = real_build
     import shutil
     shutil.rmtree(work, ignore_errors=True)
-    ok = eq_count and eq_last and eq_hour and eq_window and single and invalidated
+    ok = eq_count and eq_last and eq_hour and eq_window and single and invalidated and disk_hit
     print(f"\nportal legacy-metadata cache: {'VERIFIED' if ok else 'FAILED'}")
     return 0 if ok else 1
 

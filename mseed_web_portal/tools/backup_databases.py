@@ -21,7 +21,11 @@ def backup_hdf5_database(source: str, destination: str, *, compress_level: int) 
     """Create a readable HDF5 snapshot and gzip it for retention."""
     temporary = destination.removesuffix(".gz") + ".tmp"
     try:
-        with h5py.File(source, "r") as src, h5py.File(temporary, "w") as dst:
+        # locking=False: the receiver appends to these files continuously and
+        # takes an HDF5/POSIX lock on each write. A locking read here would make
+        # those writes fail ("unable to lock file") and quarantine live packets
+        # for as long as the copy runs. The portal reads the same way.
+        with h5py.File(source, "r", locking=False) as src, h5py.File(temporary, "w") as dst:
             for key, value in src.attrs.items():
                 dst.attrs[key] = value
             for name in src:
@@ -62,14 +66,22 @@ def main() -> int:
         total += stage2.backup_sqlite_database(settings.app_db, app_dst, compress_level=compress_level)
         files.append(app_dst)
 
+        # Back up every receiver file once, named after the file itself. Several
+        # devices share a device_key (e.g. SS_01201 from five IPs), so naming by
+        # key made each copy overwrite the previous one; merged member files
+        # (device_merge_members) were not included at all.
+        sources: list[str] = []
         for d in app_db.list_devices(settings.app_db, admin=True):
-            src = d["db_path"]
-            if not src or not os.path.exists(src):
-                continue
-            label = str(d["device_key"] or d["label"] or Path(src).stem).replace("/", "_")
-            if not src.endswith(".h5"):
-                continue
-            dst = os.path.join(out_dir, f"receiver_{label}_{stamp}.h5.gz")
+            paths = [d["db_path"]]
+            try:
+                paths += app_db.get_device_member_paths(settings.app_db, int(d["id"]))
+            except Exception:
+                pass
+            for src in paths:
+                if src and src.endswith(".h5") and os.path.exists(src) and src not in sources:
+                    sources.append(src)
+        for src in sources:
+            dst = os.path.join(out_dir, f"receiver_{Path(src).stem}_{stamp}.h5.gz")
             total += backup_hdf5_database(src, dst, compress_level=compress_level)
             files.append(dst)
 

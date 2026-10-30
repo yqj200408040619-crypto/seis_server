@@ -50,6 +50,12 @@ fi
 
 echo "[6/8] Installing systemd service"
 cp "$APP_DIR/systemd/mseed-web-portal.service" "$SERVICE_FILE"
+# Memory limits + MALLOC_ARENA_MAX (see systemd/mseed-web-portal.service.d/memory.conf).
+mkdir -p "$SERVICE_FILE.d"
+cp "$APP_DIR/systemd/mseed-web-portal.service.d/memory.conf" "$SERVICE_FILE.d/memory.conf"
+# Shared on-disk cache for legacy rec_* metadata (portal + alert worker).
+SERVICE_USER=$(sed -n 's/^User=//p' "$SERVICE_FILE" | head -1)
+install -d -o "${SERVICE_USER:-mseedweb}" -g "${SERVICE_USER:-mseedweb}" -m 755 /var/cache/mseed-web-portal /var/cache/mseed-web-portal/legacy
 systemctl daemon-reload
 systemctl enable mseed-web-portal
 

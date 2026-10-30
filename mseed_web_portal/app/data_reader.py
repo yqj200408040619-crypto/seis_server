@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 from contextlib import contextmanager
 from io import BytesIO
 import math
@@ -129,6 +130,55 @@ def _build_legacy_meta(grp: "h5py.Group") -> _LegacyMeta:
                        np.asarray(end, dtype=np.float64), np.asarray(recv, dtype=np.float64))
 
 
+# On-disk copy of the cache so short-lived processes (the alert worker runs
+# every 60 s; the portal after a restart) don't rescan large legacy files.
+# Same key as the in-memory cache (path, inode, group, member count): appends
+# to a live file don't change it, so one file per stream is written, and a
+# rewritten file (new inode) or a changed legacy set gets a new key.
+# Best effort: if the directory is missing or unwritable, it is skipped.
+_LEGACY_DISK_DIR = os.environ.get("MSEED_LEGACY_CACHE_DIR", "/var/cache/mseed-web-portal/legacy")
+
+
+def _legacy_disk_path(grp: "h5py.Group", key: tuple) -> str | None:
+    if key[1] == (None, None):
+        return None
+    stream = hashlib.sha256(repr((key[0], key[2])).encode()).hexdigest()[:16]
+    version = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+    return os.path.join(_LEGACY_DISK_DIR, f"{stream}-{version}.npz")
+
+
+def _legacy_disk_load(path: str | None) -> _LegacyMeta | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            return _LegacyMeta([str(n) for n in z["names"]], z["start"], z["end"], z["recv"])
+    except Exception:
+        return None
+
+
+def _legacy_disk_save(path: str | None, meta: _LegacyMeta) -> None:
+    if not path or not os.path.isdir(_LEGACY_DISK_DIR):
+        return
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "wb") as fh:
+            np.savez(fh, names=np.asarray(meta.names, dtype=str), start=meta.start, end=meta.end, recv=meta.recv)
+        os.replace(tmp, path)
+        prefix = os.path.basename(path).split("-", 1)[0] + "-"
+        for old in os.listdir(_LEGACY_DISK_DIR):
+            if old.startswith(prefix) and old.endswith(".npz") and old != os.path.basename(path):
+                try:
+                    os.unlink(os.path.join(_LEGACY_DISK_DIR, old))
+                except OSError:
+                    pass
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def _legacy_meta(grp: "h5py.Group") -> _LegacyMeta:
     """Cached legacy metadata for one stream group.
 
@@ -151,7 +201,11 @@ def _legacy_meta(grp: "h5py.Group") -> _LegacyMeta:
             hit = _LEGACY_CACHE.get(key)
             if hit is not None:
                 return hit
-        meta = _build_legacy_meta(grp)
+        disk_path = _legacy_disk_path(grp, key)
+        meta = _legacy_disk_load(disk_path)
+        if meta is None or len(meta.names) != len(meta.start):
+            meta = _build_legacy_meta(grp)
+            _legacy_disk_save(disk_path, meta)
         with _LEGACY_CACHE_LOCK:
             # Drop stale entries for the same stream (file rewritten/changed).
             for k in [k for k in _LEGACY_CACHE if k[0] == key[0] and k[2] == key[2]]:
