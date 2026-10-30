@@ -42,7 +42,7 @@
 | 2.4 | gzip 压缩 CPU 瓶颈 | 高吞吐 + gzip level 6 | worker CPU；对比关闭压缩 | `config.py` | ⬜ |
 | 2.5 | 去重缓存正确性 | 重复发送相同记录 | sha256 判重生效，不重复写 | `_sha256_cache` | ⬜ |
 | 2.6 | 写失败重试 & 隔离 | 注入 HDF5 写异常 | `_evict_handle`→重试→`quarantine_packet`，流不卡死 | `insert_packet` | ⬜ |
-| 2.7 | 优雅关闭 drain | 队列积压时关停 | `close()` 30s 内 drain，超时退出不挂起 | `MSeedWritePipeline.close()` | ✅ |
+| 2.7 | 优雅关闭 drain | 队列积压时关停 | `close()` 30s 内 drain，超时退出不挂起；**SIGTERM 亦走此路径（见下）** | `MSeedWritePipeline.close()` | ✅ |
 
 ## 三、HDF5 存储 — 并发读写一致性 & 容量
 
@@ -81,7 +81,7 @@
 |---|--------|------|---------|------|
 | 6.1 | 磁盘写满 | HDF5 分区占满 | 走隔离逻辑、报警，服务不崩；恢复后自愈 | ⬜ |
 | 6.2 | HDF5 文件损坏 | 写一半被 kill | 门户读端重试降级不崩；接收端隔离/跳过 | ⬜ |
-| 6.3 | 接收端进程重启 | 高负载中重启 | 优雅 drain；重启后 index/sha256 正确 reseed | ⬜ |
+| 6.3 | 接收端进程重启 | 高负载中重启（SIGTERM） | 优雅 drain；重启后 index/sha256 正确 reseed；**HDF5 不残留写锁** | ✅ 已修复（`test_sigterm_shutdown.py`） |
 | 6.4 | 门户进程重启 | 有在途大导出时重启 | 连接释放，无句柄残留 | ⬜ |
 
 ---
@@ -126,6 +126,8 @@
 | **5.1** 大导出非流式 + 占池 | 单次 `max_records=200000` 物化 **~203 MB**，非流式 | `data_reader.export_mseed_stream` 生成器逐条 `yield`；**legacy 重编码路径也按 `legacy_flush_every` 批量 flush**（全 legacy 文件也保持 O(batch)）；`main.py` 路由改 `StreamingResponse` + 并发导出闸门（超额返回 503） | `test_06`：raw 路径 203MB→**0.002MB**；legacy 分批 5k/50k 条均 ~0.25MB；闸门拒绝超额 |
 | **5.2** 登录风暴 DoS | bcrypt(rounds=12) + `workers=1` 可被登录洪泛打满线程池 | 新增 `login_guard.py`：失败限流 + 临时锁定（bcrypt 前拦截）+ bcrypt 并发闸门；`main.py` 登录路由接入 | `test_07`：锁定/过期/成功重置/窗口滑动/并发闸门全部验证 |
 | **5.5** SQLite busy_timeout 不一致 | 持锁 7s 时 web 侧 `database is locked`，stage2 成功 | `app_db.connect()` 显式 `timeout=20` + `PRAGMA busy_timeout=20000`，与 stage2 对齐 | `test_05`：修复后连接器等到 7s 锁并成功 |
+| **1.5-bug** no-record 日志 `NameError` | 慢滴流守卫触发时日志误用裸 `last_record_unix`，在 `_quarantine()` 前崩溃 handler → 半包静默丢失、无告警 | `server.py` 改为 `self.last_record_unix` | `test_08`：慢滴流半包被 quarantine（reason=`no_record_timeout_partial_buffer`）；去掉修复则无 quarantine 文件、断言失败 |
+| **6.3/2.7-bug** 接收端无 SIGTERM 处理 | 仅捕获 SIGINT；systemd `Type=simple`+默认 `KillSignal=SIGTERM`，每次重启在写中途被杀 → HDF5 残留写锁（“already open for write”），门户需 `h5clear` 方可读 | `server.py` `run_server()` 注册 SIGTERM，由辅助线程调 `srv.shutdown()`→排空→`db.close()` 干净关闭 | `test_sigterm_shutdown.py`：去掉处理器=0.0s 被杀+多文件锁死；修复后≈26–29s 优雅排空+0 锁死 |
 
 > **修复均带配置开关**，默认值保守、可通过配置文件 / 环境变量调整
 > （`idle_no_record_sec`、`sha256_cache_max_per_stream`、`device_cache_ttl_sec`、

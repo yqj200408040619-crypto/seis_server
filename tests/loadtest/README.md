@@ -28,6 +28,11 @@ python tests/loadtest/run_e2e.py --connections 600 --records 4000   # 加压
 ## 单独运行各驱动(对已运行的服务)
 
 ```bash
+# 0) SIGTERM 优雅关闭回归(2.7 / 3.x,需真实 h5py/obspy/numpy)
+#    启动临时接收端 → 灌包 → 发送 SIGTERM(等同 systemctl stop / terminate())
+#    → 验证进程优雅退出且 HDF5 设备文件未被残留写锁(无需 h5clear)。
+python tests/loadtest/test_sigterm_shutdown.py
+
 # 1) 生成测试数据
 python tests/loadtest/gen_mseed.py --out /tmp/fx --stations 8 --channels 3 --records 2000
 
@@ -64,3 +69,23 @@ python tests/loadtest/loadtest_portal.py --base http://127.0.0.1:8000 \
 - `export` / `waveform` 场景需要 app.db 中存在 `--device-id` 对应、且当前用户有权限的设备;
   请用门户的管理流程注册设备后再压测(或在 staging 用既有数据)。
 - 建议配合 `top`/`/proc/<pid>/status` 观察接收端与门户进程的 RSS 曲线,验证 4.x 的内存平稳性。
+
+## 本轮端到端复核发现并修复的缺陷
+
+- **缺陷 2（接收端无 SIGTERM 处理 → HDF5 残留写锁，生产相关）**：`server.py` 原来只捕获
+  `KeyboardInterrupt`/`SystemExit`（即 SIGINT），**没有** SIGTERM 处理。生产 systemd
+  单元为 `Type=simple` + 默认 `KillSignal=SIGTERM`，因此每次 `systemctl stop`/重启
+  都会在写入中途**立即杀死**进程，写队列不排空、在写的 h5py 句柄不关闭，设备 HDF5
+  文件被残留一致性标志（“already open for write”），门户在 `h5clear` 之前无法读取。
+  修复：在 `run_server()` 内注册 SIGTERM 处理器，由一个辅助线程调用 `srv.shutdown()`
+  （`shutdown()` 必须在 `serve_forever` 线程之外调用）；`serve_forever` 返回后经
+  `with` 退出 → `server_close` → `pipeline.close()` 排空(30s 上限) → `db.close()`
+  干净关闭所有 HDF5。新增 `test_sigterm_shutdown.py` 回归守卫（去掉处理器:0.0s 被杀、
+  多个文件被锁、断言失败;修复后:约 26–29s 优雅排空、0 文件被锁、通过）。
+  > 行为变化:优雅关闭最长可达 `drain_timeout_sec`(30s)。systemd 默认
+  > `TimeoutStopSec=90s`,在此范围内;但配合 `Restart=always` 会使重启变慢,运维需知晓。
+
+- **`run_e2e.py` 接收端 `log_dir` 缺失**:编排脚本原来未给接收端的 INI 写 `log_dir`,
+  导致接收端回退到生产日志路径 `/var/log/mseed-tcp-server` 并因权限不足崩溃
+  (`PermissionError`)。已在生成的 `receiver.ini` 中加入指向临时 `logs/` 的 `log_dir`,
+  使 e2e 可由任意用户在不触碰生产路径的前提下运行。

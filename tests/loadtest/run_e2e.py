@@ -113,9 +113,10 @@ def main() -> int:
         ini = os.path.join(work, "receiver.ini")
         with open(ini, "w") as fh:
             fh.write(f"[server]\nport={args.tcp_port}\nmax_clients=512\n"
-                     f"idle_no_record_sec=600\n"
-                     f"[storage]\nbase_dir={data_base}\n"
-                     f"sha256_cache_max_per_stream=20000\ndevice_cache_ttl_sec=86400\n")
+                                 f"idle_no_record_sec=600\n"
+                                 f"[storage]\nbase_dir={data_base}\n"
+                                 f"log_dir={logs}\n"
+                                 f"sha256_cache_max_per_stream=20000\ndevice_cache_ttl_sec=86400\n")
         procs.append(subprocess.Popen(
             [sys.executable, "-m", "mseed_tcp_server", "--config", ini],
             cwd=TCP_PKG, env=tcp_env, stdout=tcp_log, stderr=subprocess.STDOUT))

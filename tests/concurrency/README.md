@@ -40,8 +40,18 @@ for t in test_0*.py; do python3 "$t"; done
 | `test_05_sqlite_busy.py` | 5.5 SQLite 写锁 busy_timeout | **✅ 已修复并验证**（显式 timeout=20）|
 | `test_06_portal_blocking.py` | 5.1 大导出内存/非流式 + 导出闸门 / 线程池排队 | **✅ 已修复并验证**（流式 + 闸门）|
 | `test_07_login_guard.py` | 5.2 登录限流 + bcrypt 并发闸门 | **✅ 已修复并验证** |
+| `test_08_no_record_quarantine.py` | 1.5 回归：no-record 超时路径的日志与 quarantine | **✅ 修复并验证**（见下方缺陷说明）|
 
-所有脚本现在断言的是**修复后的预期行为**（而非仅复现缺陷），7/7 通过。
+所有脚本现在断言的是**修复后的预期行为**（而非仅复现缺陷），8/8 通过。
+
+## 本轮复核发现并修复的缺陷
+
+- **缺陷 1（`server.py` no-record 超时日志 `NameError`）**：1.5 慢滴流守卫触发时，
+  日志语句误用裸变量 `last_record_unix`（应为 `self.last_record_unix`），抛出
+  `NameError`，在 `self._quarantine(...)` **之前**就崩溃了 handler。后果：慢滴流
+  连接的半包既没有被 quarantine，也没有告警日志，数据静默丢失。`test_02` 只断言
+  连接被回收，因而漏掉了此路径。已修复，并新增 `test_08_no_record_quarantine.py`
+  作为回归守卫（去掉修复会断言失败、无 quarantine 文件；修复后通过）。
 
 ## 未能在沙盒中执行的项（需在真实部署环境补测）
 

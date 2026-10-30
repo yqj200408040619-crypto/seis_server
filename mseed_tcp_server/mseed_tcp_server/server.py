@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import queue
+import signal
 import socket
 import socketserver
 import threading
@@ -244,7 +245,7 @@ class MSeedRequestHandler(socketserver.BaseRequestHandler):
                     LOG.warning(
                         "no-record timeout: no complete record from %s:%s for %.0fs "
                         "(received %d bytes); closing slow/stuck connection",
-                        self.client_ip, self.client_port, now - last_record_unix, self.byte_count,
+                        self.client_ip, self.client_port, now - self.last_record_unix, self.byte_count,
                     )
                     if buffer:
                         self._quarantine(buffer, "no_record_timeout_partial_buffer")
@@ -359,11 +360,37 @@ class MSeedRequestHandler(socketserver.BaseRequestHandler):
 def run_server(config: AppConfig) -> None:
     db_manager = DeviceDatabaseManager(config)
     address = (config.server.host, config.server.port)
-    
+
     # Outer try ensures logging is performed even if SystemExit is raised inside the with block
     try:
         with MSeedTCPServer(address, MSeedRequestHandler, config, db_manager) as srv:
             LOG.info("mseed TCP server listening on %s:%s", config.server.host, config.server.port)
+
+            # Translate SIGTERM (what `systemctl stop` and subprocess.terminate()
+            # send) into a clean serve_forever() shutdown. Without this, SIGTERM
+            # kills the process instantly, mid-write, so the bounded write queue
+            # is never drained and the in-flight h5py append handle is never
+            # closed — leaving the device HDF5 file with its consistency flag set
+            # ("already open for write") until an operator runs h5clear. The
+            # production systemd unit is Type=simple with the default
+            # KillSignal=SIGTERM, so this affected every normal restart.
+            #
+            # BaseServer.shutdown() must be called from a DIFFERENT thread than
+            # the one running serve_forever(), so the handler spawns a tiny
+            # thread to request the stop. serve_forever() then returns normally,
+            # the `with` block exits and server_close() drains the queue and
+            # closes all HDF5 handles.
+            def _on_sigterm(signum, frame):
+                LOG.info("Received SIGTERM, initiating graceful shutdown...")
+                threading.Thread(target=srv.shutdown, name="sigterm-shutdown",
+                                 daemon=True).start()
+            try:
+                signal.signal(signal.SIGTERM, _on_sigterm)
+            except (ValueError, OSError):
+                # signal.signal only works in the main thread; if run_server is
+                # ever invoked off-thread, fall back to prior behaviour.
+                LOG.warning("could not install SIGTERM handler (not main thread?)")
+
             try:
                 srv.serve_forever(poll_interval=0.5)
             except (KeyboardInterrupt, SystemExit):
