@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 from contextlib import contextmanager
 from io import BytesIO
 import math
 import os
 import re
+import threading
 import time
 from typing import Any
 
@@ -63,17 +65,161 @@ def _has_index(grp: "h5py.Group") -> bool:
     return isinstance(grp, h5py.Group) and "index" in grp and isinstance(grp.get("index"), h5py.Dataset)
 
 
-def _legacy_record_datasets(grp: "h5py.Group") -> list:
-    """rec_* / gap_* 波形 dataset（排除 index/samples/raw_blob 等结构数组）。"""
-    reserved = {"index", "samples", "raw_blob"}
+_LEGACY_RESERVED = {"index", "samples", "raw_blob"}
+
+
+def _scan_legacy_record_datasets(grp: "h5py.Group") -> list:
+    """rec_* / gap_* 波形 dataset（排除 index/samples/raw_blob 等结构数组）。
+
+    Uncached full scan: reads the attributes of every member. On old
+    one-dataset-per-record files this is very expensive (tens of thousands of
+    attribute reads); callers go through ``_legacy_meta`` instead.
+    """
     out = []
     for name in grp.keys():
-        if name in reserved:
+        if name in _LEGACY_RESERVED:
             continue
         item = grp[name]
         if isinstance(item, h5py.Dataset) and item.attrs.get("start_unix") is not None:
             out.append(name)
     return out
+
+
+class _LegacyMeta:
+    """Per-stream summary of legacy ``rec_*`` datasets, built once."""
+
+    __slots__ = ("names", "start", "end", "recv")
+
+    def __init__(self, names: list, start: np.ndarray, end: np.ndarray, recv: np.ndarray):
+        self.names = names      # sorted dataset names
+        self.start = start      # float64 start_unix, aligned with names
+        self.end = end          # float64 end_unix (-1.0 when unknown)
+        self.recv = recv        # float64 recv_unix (0.0 when unknown)
+
+
+# The receiver no longer creates rec_* datasets (it writes the rolling
+# index/samples/raw_blob layout), so a stream's legacy set only changes if a
+# tool rewrites the file. Key the cache on the file's inode plus the group's
+# member count: a rewrite or an added/removed dataset invalidates the entry,
+# while routine index-layout appends (which only grow existing datasets) do not.
+_LEGACY_CACHE: "dict[tuple, _LegacyMeta]" = {}
+_LEGACY_CACHE_MAX = 256
+_LEGACY_CACHE_LOCK = threading.Lock()
+_LEGACY_BUILD_LOCKS: "dict[tuple, threading.Lock]" = {}
+
+
+def _legacy_cache_key(grp: "h5py.Group") -> tuple:
+    path = grp.file.filename
+    try:
+        st = os.stat(path)
+        ident = (st.st_dev, st.st_ino)
+    except OSError:
+        ident = (None, None)
+    return (os.path.realpath(path), ident, grp.name, len(grp))
+
+
+def _build_legacy_meta(grp: "h5py.Group") -> _LegacyMeta:
+    names, start, end, recv = [], [], [], []
+    for name in sorted(_scan_legacy_record_datasets(grp)):
+        attrs = grp[name].attrs
+        names.append(name)
+        start.append(float(attrs.get("start_unix")))
+        end.append(float(attrs.get("end_unix", -1.0)))
+        recv.append(float(attrs.get("recv_unix", 0.0)))
+    return _LegacyMeta(names, np.asarray(start, dtype=np.float64),
+                       np.asarray(end, dtype=np.float64), np.asarray(recv, dtype=np.float64))
+
+
+# On-disk copy of the cache so short-lived processes (the alert worker runs
+# every 60 s; the portal after a restart) don't rescan large legacy files.
+# Same key as the in-memory cache (path, inode, group, member count): appends
+# to a live file don't change it, so one file per stream is written, and a
+# rewritten file (new inode) or a changed legacy set gets a new key.
+# Best effort: if the directory is missing or unwritable, it is skipped.
+_LEGACY_DISK_DIR = os.environ.get("MSEED_LEGACY_CACHE_DIR", "/var/cache/mseed-web-portal/legacy")
+
+
+def _legacy_disk_path(grp: "h5py.Group", key: tuple) -> str | None:
+    if key[1] == (None, None):
+        return None
+    stream = hashlib.sha256(repr((key[0], key[2])).encode()).hexdigest()[:16]
+    version = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+    return os.path.join(_LEGACY_DISK_DIR, f"{stream}-{version}.npz")
+
+
+def _legacy_disk_load(path: str | None) -> _LegacyMeta | None:
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            return _LegacyMeta([str(n) for n in z["names"]], z["start"], z["end"], z["recv"])
+    except Exception:
+        return None
+
+
+def _legacy_disk_save(path: str | None, meta: _LegacyMeta) -> None:
+    if not path or not os.path.isdir(_LEGACY_DISK_DIR):
+        return
+    tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(tmp, "wb") as fh:
+            np.savez(fh, names=np.asarray(meta.names, dtype=str), start=meta.start, end=meta.end, recv=meta.recv)
+        os.replace(tmp, path)
+        prefix = os.path.basename(path).split("-", 1)[0] + "-"
+        for old in os.listdir(_LEGACY_DISK_DIR):
+            if old.startswith(prefix) and old.endswith(".npz") and old != os.path.basename(path):
+                try:
+                    os.unlink(os.path.join(_LEGACY_DISK_DIR, old))
+                except OSError:
+                    pass
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _legacy_meta(grp: "h5py.Group") -> _LegacyMeta:
+    """Cached legacy metadata for one stream group.
+
+    Single-flight: concurrent requests for the same stream wait for one build
+    instead of each scanning the file. Before this, every dashboard refresh
+    started another full scan, and overlapping scans of one large legacy file
+    could exhaust memory and get the portal OOM-killed.
+    """
+    if len(grp) <= len(_LEGACY_RESERVED) and all(n in _LEGACY_RESERVED for n in grp.keys()):
+        # Fast path: pure index-layout group, nothing legacy to scan or cache.
+        return _LegacyMeta([], np.empty(0), np.empty(0), np.empty(0))
+    key = _legacy_cache_key(grp)
+    with _LEGACY_CACHE_LOCK:
+        hit = _LEGACY_CACHE.get(key)
+        if hit is not None:
+            return hit
+        build_lock = _LEGACY_BUILD_LOCKS.setdefault(key, threading.Lock())
+    with build_lock:
+        with _LEGACY_CACHE_LOCK:
+            hit = _LEGACY_CACHE.get(key)
+            if hit is not None:
+                return hit
+        disk_path = _legacy_disk_path(grp, key)
+        meta = _legacy_disk_load(disk_path)
+        if meta is None or len(meta.names) != len(meta.start):
+            meta = _build_legacy_meta(grp)
+            _legacy_disk_save(disk_path, meta)
+        with _LEGACY_CACHE_LOCK:
+            # Drop stale entries for the same stream (file rewritten/changed).
+            for k in [k for k in _LEGACY_CACHE if k[0] == key[0] and k[2] == key[2]]:
+                del _LEGACY_CACHE[k]
+            while len(_LEGACY_CACHE) >= _LEGACY_CACHE_MAX:
+                del _LEGACY_CACHE[next(iter(_LEGACY_CACHE))]
+            _LEGACY_CACHE[key] = meta
+            _LEGACY_BUILD_LOCKS.pop(key, None)
+        return meta
+
+
+def _legacy_record_datasets(grp: "h5py.Group") -> list:
+    """rec_* / gap_* 波形 dataset（排除 index/samples/raw_blob 等结构数组）。"""
+    return list(_legacy_meta(grp).names)
 
 
 def _stream_is_new_layout(grp: "h5py.Group") -> bool:
@@ -85,7 +231,7 @@ def _stream_record_count(grp: "h5py.Group") -> int:
     count = 0
     if _has_index(grp):
         count += int(grp["index"].shape[0])
-    count += len(_legacy_record_datasets(grp))
+    count += len(_legacy_meta(grp).names)
     return count
 
 
@@ -96,11 +242,10 @@ def _stream_last_start(grp: "h5py.Group") -> float | None:
         if idx.shape[0]:
             m = float(np.max(idx["start_unix"]))
             last = m if last is None else max(last, m)
-    for name in _legacy_record_datasets(grp):
-        st = grp[name].attrs.get("start_unix")
-        if st is not None:
-            st = float(st)
-            last = st if last is None else max(last, st)
+    legacy = _legacy_meta(grp)
+    if legacy.start.size:
+        m = float(np.max(legacy.start))
+        last = m if last is None else max(last, m)
     return last
 
 
@@ -154,14 +299,15 @@ def _iter_stream_records(grp: "h5py.Group", stream_key: str,
                 emitted += 1
 
     # --- source 2: legacy rec_* datasets ---
-    for ds_name in sorted(_legacy_record_datasets(grp)):
+    legacy = _legacy_meta(grp)
+    for pos, ds_name in enumerate(legacy.names):
         if emitted >= limit_remaining:
             break
-        dset = grp[ds_name]
-        s = float(dset.attrs.get("start_unix"))
-        e = float(dset.attrs.get("end_unix", -1.0))
+        s = float(legacy.start[pos])
+        e = float(legacy.end[pos])
         if e != -1.0 and (e < start_unix or s > end_unix):
             continue
+        dset = grp[ds_name]
         meta = {"start_unix": s, "end_unix": e,
                 "sampling_rate": float(dset.attrs.get("sampling_rate", 1.0) or 1.0),
                 "network": _decode(dset.attrs.get("network", "")),
@@ -543,9 +689,9 @@ def device_summary(db_path: str, device_key: str | None = None) -> dict[str, Any
                 if idx.shape[0]:
                     recv = idx["recv_unix"][:]
                     one_hour_packets += int(np.count_nonzero(recv >= one_hour_start))
-            for name in _legacy_record_datasets(grp):
-                if float(grp[name].attrs.get("recv_unix", 0.0)) >= one_hour_start:
-                    one_hour_packets += 1
+            legacy = _legacy_meta(grp)
+            if legacy.recv.size:
+                one_hour_packets += int(np.count_nonzero(legacy.recv >= one_hour_start))
 
     return {
         "components": comps,
@@ -778,6 +924,94 @@ def export_mseed_bytes(
     buf = BytesIO()
     st.write(buf, format="MSEED")
     return buf.getvalue(), count
+
+
+def export_mseed_stream(
+    db_path: str,
+    *,
+    device_key: str,
+    components: list[str] | None,
+    start_unix: float,
+    end_unix: float,
+    max_records: int = 200000,
+    legacy_flush_every: int = 500,
+):
+    """Yield exported miniSEED bytes incrementally instead of one big blob.
+
+    ``export_mseed_bytes`` materialises the entire export in memory
+    (``b"".join(...)`` or ``st.write(buf)``), so a large time window can hold
+    hundreds of MB resident while occupying a worker thread, and several
+    concurrent exports can exhaust memory and the thread pool.
+
+    For modern receiver files every stored record keeps its exact original TCP
+    bytes (``raw``), so we stream those out record-by-record with O(1) memory.
+    Legacy records that have no usable raw bytes must be re-encoded through
+    obspy; rather than buffering the whole run, we re-encode them in small
+    batches of ``legacy_flush_every`` traces and yield each batch, so even a
+    file that is entirely legacy stays O(batch) in memory. miniSEED is a
+    concatenation of self-describing fixed-length records, so emitting multiple
+    written blocks back-to-back yields a valid stream. Yields ``bytes`` chunks;
+    yields nothing when there is no data in range.
+    """
+    if is_obn_h5(db_path):
+        return
+    if end_unix <= start_unix:
+        raise ValueError("End time must be greater than start time")
+
+    legacy_batch = Stream()
+    flush_every = max(1, int(legacy_flush_every))
+
+    def _flush_legacy() -> bytes | None:
+        if len(legacy_batch) == 0:
+            return None
+        buf = BytesIO()
+        legacy_batch.write(buf, format="MSEED")
+        legacy_batch.clear()
+        return buf.getvalue()
+
+    count = 0
+    with open_h5_read(db_path) as f:
+        for stream_key in f.keys():
+            if count >= max_records:
+                break
+            grp = f[stream_key]
+            if not isinstance(grp, h5py.Group):
+                continue
+            if components and stream_key.rsplit(".", 1)[-1] not in components:
+                continue
+            for wf, raw, meta in _iter_stream_records(grp, stream_key, start_unix, end_unix, max_records - count):
+                if count >= max_records:
+                    break
+                if raw:
+                    try:
+                        read(BytesIO(raw), format="MSEED", headonly=True)
+                    except Exception:
+                        pass
+                    else:
+                        count += 1
+                        yield raw          # stream the exact record, O(1) memory
+                        continue
+                # Legacy record without usable raw bytes: must be re-encoded via
+                # obspy. Buffer only a small batch, then flush and release it.
+                data = np.asarray(wf)
+                tr = Trace(data=data)
+                tr.stats.network = meta["network"]
+                tr.stats.station = meta["station"]
+                tr.stats.location = meta["location"]
+                tr.stats.channel = meta["channel"]
+                tr.stats.sampling_rate = meta["sampling_rate"] or 1.0
+                tr.stats.starttime = UTCDateTime(meta["start_unix"])
+                legacy_batch.append(tr)
+                count += 1
+                if len(legacy_batch) >= flush_every:
+                    chunk = _flush_legacy()
+                    if chunk:
+                        yield chunk
+
+    # Flush any remaining re-encoded legacy traces.
+    tail = _flush_legacy()
+    if tail:
+        yield tail
 
 
 def export_latest_window_stage3(db_path: str, *, device_key: str, minutes: int = 30) -> dict[str, Any]:
