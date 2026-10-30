@@ -89,3 +89,15 @@ python tests/loadtest/loadtest_portal.py --base http://127.0.0.1:8000 \
   导致接收端回退到生产日志路径 `/var/log/mseed-tcp-server` 并因权限不足崩溃
   (`PermissionError`)。已在生成的 `receiver.ini` 中加入指向临时 `logs/` 的 `log_dir`,
   使 e2e 可由任意用户在不触碰生产路径的前提下运行。
+
+- **缺陷 3（门户 OOM：旧版逐记录 dataset 的元数据被反复全量扫描）**:旧接收端文件每条记录一个
+  HDF5 dataset(如 1.1 GB 的 `SS_02003`,约 6.7 万个)。`device_summary`/`list_components`
+  在每次仪表盘 / `/api/devices` 请求时读取全部 dataset 的属性:单次约 2 分钟、约 250 MB,
+  4 个并发即 756 MB、6.5 分钟,重复刷新叠加后被内核 OOM 杀掉(8–10 月共 5 次)。
+  修复:`data_reader` 对每个流的旧 `rec_*` 元数据只构建一次(single-flight)并缓存,
+  以文件 inode + 组成员数为键(接收端已不再写 `rec_*`)。实测:12 个并发仪表盘 1.1 s、
+  峰值 384 MB;输出与旧代码在全部 8 个真实设备文件上逐字段一致。
+  回归测试:`python tests/loadtest/test_portal_legacy_cache.py`(需 h5py;验证结果一致、
+  并发仅构建一次、组变化后失效重建;对旧代码运行会失败)。
+  部署侧另加 systemd drop-in:`MemoryHigh=900M`、`MemoryMax=1200M`、`MemorySwapMax=256M`、
+  `MALLOC_ARENA_MAX=2`,单个失控请求只会重启门户,而不会拖垮整机。

@@ -6,6 +6,7 @@ from io import BytesIO
 import math
 import os
 import re
+import threading
 import time
 from typing import Any
 
@@ -63,17 +64,108 @@ def _has_index(grp: "h5py.Group") -> bool:
     return isinstance(grp, h5py.Group) and "index" in grp and isinstance(grp.get("index"), h5py.Dataset)
 
 
-def _legacy_record_datasets(grp: "h5py.Group") -> list:
-    """rec_* / gap_* 波形 dataset（排除 index/samples/raw_blob 等结构数组）。"""
-    reserved = {"index", "samples", "raw_blob"}
+_LEGACY_RESERVED = {"index", "samples", "raw_blob"}
+
+
+def _scan_legacy_record_datasets(grp: "h5py.Group") -> list:
+    """rec_* / gap_* 波形 dataset（排除 index/samples/raw_blob 等结构数组）。
+
+    Uncached full scan: reads the attributes of every member. On old
+    one-dataset-per-record files this is very expensive (tens of thousands of
+    attribute reads); callers go through ``_legacy_meta`` instead.
+    """
     out = []
     for name in grp.keys():
-        if name in reserved:
+        if name in _LEGACY_RESERVED:
             continue
         item = grp[name]
         if isinstance(item, h5py.Dataset) and item.attrs.get("start_unix") is not None:
             out.append(name)
     return out
+
+
+class _LegacyMeta:
+    """Per-stream summary of legacy ``rec_*`` datasets, built once."""
+
+    __slots__ = ("names", "start", "end", "recv")
+
+    def __init__(self, names: list, start: np.ndarray, end: np.ndarray, recv: np.ndarray):
+        self.names = names      # sorted dataset names
+        self.start = start      # float64 start_unix, aligned with names
+        self.end = end          # float64 end_unix (-1.0 when unknown)
+        self.recv = recv        # float64 recv_unix (0.0 when unknown)
+
+
+# The receiver no longer creates rec_* datasets (it writes the rolling
+# index/samples/raw_blob layout), so a stream's legacy set only changes if a
+# tool rewrites the file. Key the cache on the file's inode plus the group's
+# member count: a rewrite or an added/removed dataset invalidates the entry,
+# while routine index-layout appends (which only grow existing datasets) do not.
+_LEGACY_CACHE: "dict[tuple, _LegacyMeta]" = {}
+_LEGACY_CACHE_MAX = 256
+_LEGACY_CACHE_LOCK = threading.Lock()
+_LEGACY_BUILD_LOCKS: "dict[tuple, threading.Lock]" = {}
+
+
+def _legacy_cache_key(grp: "h5py.Group") -> tuple:
+    path = grp.file.filename
+    try:
+        st = os.stat(path)
+        ident = (st.st_dev, st.st_ino)
+    except OSError:
+        ident = (None, None)
+    return (os.path.realpath(path), ident, grp.name, len(grp))
+
+
+def _build_legacy_meta(grp: "h5py.Group") -> _LegacyMeta:
+    names, start, end, recv = [], [], [], []
+    for name in sorted(_scan_legacy_record_datasets(grp)):
+        attrs = grp[name].attrs
+        names.append(name)
+        start.append(float(attrs.get("start_unix")))
+        end.append(float(attrs.get("end_unix", -1.0)))
+        recv.append(float(attrs.get("recv_unix", 0.0)))
+    return _LegacyMeta(names, np.asarray(start, dtype=np.float64),
+                       np.asarray(end, dtype=np.float64), np.asarray(recv, dtype=np.float64))
+
+
+def _legacy_meta(grp: "h5py.Group") -> _LegacyMeta:
+    """Cached legacy metadata for one stream group.
+
+    Single-flight: concurrent requests for the same stream wait for one build
+    instead of each scanning the file. Before this, every dashboard refresh
+    started another full scan, and overlapping scans of one large legacy file
+    could exhaust memory and get the portal OOM-killed.
+    """
+    if len(grp) <= len(_LEGACY_RESERVED) and all(n in _LEGACY_RESERVED for n in grp.keys()):
+        # Fast path: pure index-layout group, nothing legacy to scan or cache.
+        return _LegacyMeta([], np.empty(0), np.empty(0), np.empty(0))
+    key = _legacy_cache_key(grp)
+    with _LEGACY_CACHE_LOCK:
+        hit = _LEGACY_CACHE.get(key)
+        if hit is not None:
+            return hit
+        build_lock = _LEGACY_BUILD_LOCKS.setdefault(key, threading.Lock())
+    with build_lock:
+        with _LEGACY_CACHE_LOCK:
+            hit = _LEGACY_CACHE.get(key)
+            if hit is not None:
+                return hit
+        meta = _build_legacy_meta(grp)
+        with _LEGACY_CACHE_LOCK:
+            # Drop stale entries for the same stream (file rewritten/changed).
+            for k in [k for k in _LEGACY_CACHE if k[0] == key[0] and k[2] == key[2]]:
+                del _LEGACY_CACHE[k]
+            while len(_LEGACY_CACHE) >= _LEGACY_CACHE_MAX:
+                del _LEGACY_CACHE[next(iter(_LEGACY_CACHE))]
+            _LEGACY_CACHE[key] = meta
+            _LEGACY_BUILD_LOCKS.pop(key, None)
+        return meta
+
+
+def _legacy_record_datasets(grp: "h5py.Group") -> list:
+    """rec_* / gap_* 波形 dataset（排除 index/samples/raw_blob 等结构数组）。"""
+    return list(_legacy_meta(grp).names)
 
 
 def _stream_is_new_layout(grp: "h5py.Group") -> bool:
@@ -85,7 +177,7 @@ def _stream_record_count(grp: "h5py.Group") -> int:
     count = 0
     if _has_index(grp):
         count += int(grp["index"].shape[0])
-    count += len(_legacy_record_datasets(grp))
+    count += len(_legacy_meta(grp).names)
     return count
 
 
@@ -96,11 +188,10 @@ def _stream_last_start(grp: "h5py.Group") -> float | None:
         if idx.shape[0]:
             m = float(np.max(idx["start_unix"]))
             last = m if last is None else max(last, m)
-    for name in _legacy_record_datasets(grp):
-        st = grp[name].attrs.get("start_unix")
-        if st is not None:
-            st = float(st)
-            last = st if last is None else max(last, st)
+    legacy = _legacy_meta(grp)
+    if legacy.start.size:
+        m = float(np.max(legacy.start))
+        last = m if last is None else max(last, m)
     return last
 
 
@@ -154,14 +245,15 @@ def _iter_stream_records(grp: "h5py.Group", stream_key: str,
                 emitted += 1
 
     # --- source 2: legacy rec_* datasets ---
-    for ds_name in sorted(_legacy_record_datasets(grp)):
+    legacy = _legacy_meta(grp)
+    for pos, ds_name in enumerate(legacy.names):
         if emitted >= limit_remaining:
             break
-        dset = grp[ds_name]
-        s = float(dset.attrs.get("start_unix"))
-        e = float(dset.attrs.get("end_unix", -1.0))
+        s = float(legacy.start[pos])
+        e = float(legacy.end[pos])
         if e != -1.0 and (e < start_unix or s > end_unix):
             continue
+        dset = grp[ds_name]
         meta = {"start_unix": s, "end_unix": e,
                 "sampling_rate": float(dset.attrs.get("sampling_rate", 1.0) or 1.0),
                 "network": _decode(dset.attrs.get("network", "")),
@@ -543,9 +635,9 @@ def device_summary(db_path: str, device_key: str | None = None) -> dict[str, Any
                 if idx.shape[0]:
                     recv = idx["recv_unix"][:]
                     one_hour_packets += int(np.count_nonzero(recv >= one_hour_start))
-            for name in _legacy_record_datasets(grp):
-                if float(grp[name].attrs.get("recv_unix", 0.0)) >= one_hour_start:
-                    one_hour_packets += 1
+            legacy = _legacy_meta(grp)
+            if legacy.recv.size:
+                one_hour_packets += int(np.count_nonzero(legacy.recv >= one_hour_start))
 
     return {
         "components": comps,
