@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-end mb-4 flex-wrap gap-3">
+  <div>
+    <div class="portal-pill mb-2">Admin</div>
+    <h1 class="h3 fw-bold mb-1">账号与设备权限</h1>
+    <p class="text-secondary mb-0">同步接收端数据库，创建客户账号，并分配可访问设备。</p>
+  </div>
+  <form method="post" action="/admin/sync-devices">
+    <button class="btn btn-primary">同步设备</button>
+  </form>
+</div>
+
+<div class="row g-4">
+  <div class="col-12 col-xl-4">
+    <div class="device-card">
+      <h2 class="h6 fw-bold mb-3">创建 / 更新用户</h2>
+      <form method="post" action="/admin/users">
+        <label class="form-label">账号</label>
+        <input class="form-control mb-3" name="username" required>
+        <label class="form-label">显示名称</label>
+        <input class="form-control mb-3" name="display_name">
+        <label class="form-label">密码</label>
+        <input class="form-control mb-3" type="password" name="password" required>
+        <label class="form-label">角色</label>
+        <select class="form-select mb-3" name="role"><option value="user">user</option><option value="admin">admin</option></select>
+        <button class="btn btn-primary w-100">保存用户</button>
+      </form>
+    </div>
+  </div>
+  <div class="col-12 col-xl-8">
+    <div class="device-card mb-4">
+      <h2 class="h6 fw-bold mb-3">设备列表</h2>
+      <div class="table-responsive">
+        <table class="table table-dark table-sm align-middle">
+          <thead><tr><th>ID</th><th>标签</th><th>Key</th><th>类型</th><th>序号</th><th>数据库</th></tr></thead>
+          <tbody>
+          {% for d in devices %}
+          <tr><td>{{ d.id }}</td><td>{{ d.label }}</td><td>{{ d.device_key }}</td><td>{{ d.instrument_type }}</td><td>{{ d.instrument_serial }}</td><td class="small text-secondary">{{ d.db_path }}</td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <div class="device-card">
+      <h2 class="h6 fw-bold mb-3">权限分配</h2>
+      <div class="table-responsive">
+        <table class="table table-dark table-sm align-middle">
+          <thead><tr><th>用户</th><th>角色</th><th>已授权设备</th><th>授权 / 取消</th></tr></thead>
+          <tbody>
+          {% for u in users %}
+          <tr>
+            <td>{{ u.username }}</td><td>{{ u.role }}</td>
+            <td>{% for d in devices %}{% if d.id in assigned[u.id] %}<span class="component-badge">{{ d.device_key }}</span>{% endif %}{% endfor %}</td>
+            <td>
+              <div class="d-flex flex-wrap gap-2">
+              {% for d in devices %}
+                {% if d.id in assigned[u.id] %}
+                <form method="post" action="/admin/revoke"><input type="hidden" name="user_id" value="{{ u.id }}"><input type="hidden" name="device_id" value="{{ d.id }}"><button class="btn btn-sm btn-outline-warning">取消 {{ d.device_key }}</button></form>
+                {% else %}
+                <form method="post" action="/admin/grant"><input type="hidden" name="user_id" value="{{ u.id }}"><input type="hidden" name="device_id" value="{{ d.id }}"><button class="btn btn-sm btn-outline-light">授权 {{ d.device_key }}</button></form>
+                {% endif %}
+              {% endfor %}
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}

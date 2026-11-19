@@ -1,0 +1,258 @@
+{
+  "baseline_commit": "d923a220870a5aa2a694d531fc47d68ca33c81d9",
+  "date": "2026-11-19",
+  "sources": [
+    {
+      "source": "mseed_migration_kit.zip",
+      "source_sha256": "2f01bad009d68c371c864fe6ca18a79b8a50f5e284d87edda606bf3e68bc9192",
+      "destination": "tools/migration",
+      "strip_prefix": "",
+      "library_file_id": "libfile_54bb6eafec308191904160ac0117a7e4",
+      "imported": 3,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_complete_offline_runtime_kit.zip",
+      "source_sha256": "4bd1e44840e1699584ec2449626977d4843ea8ba9aae8ef442c444e19e7011ef",
+      "destination": "tools/offline_runtime",
+      "strip_prefix": "",
+      "library_file_id": "libfile_74c528e56b648191b46299633c02e427",
+      "imported": 3,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_tcp_server_project_v2_search_keys.zip",
+      "source_sha256": "bd97c2b6a54ebb4af7591adc963c985eb67ba54d9781ae65214185fbbfe290df",
+      "destination": "archive/legacy_snapshots/tcp_v2",
+      "strip_prefix": "mseed_tcp_server_project/",
+      "library_file_id": "libfile_291cb94c196081919a2dfbab212e1ccc",
+      "imported": 18,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_tcp_server_project.zip",
+      "source_sha256": "75c8819aa56ac979051be841231d70f1c04ae260d775fb5999f887eb13835e46",
+      "destination": "archive/legacy_snapshots/tcp_v1",
+      "strip_prefix": "mseed_tcp_server_project/",
+      "library_file_id": "libfile_41ae584b31d48191bd63b0b046f1e05d",
+      "imported": 16,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_portal_project_py310_fix.zip",
+      "source_sha256": "a328c9b7af665bf36bb2f3aa3445dd55e41583d9aa0c57ef390d55c0b4511120",
+      "destination": "archive/legacy_snapshots/portal_py310",
+      "strip_prefix": "mseed_web_portal_project/",
+      "library_file_id": "libfile_190cbd510c7481918c75ed1d6e39a245",
+      "imported": 25,
+      "excluded": 9
+    },
+    {
+      "source": "mseed_web_portal_project.zip",
+      "source_sha256": "691dd47d34948a767177587e1b048c51353856040eb7bb37e1ff9d075c3c1ed6",
+      "destination": "archive/legacy_snapshots/portal_original",
+      "strip_prefix": "mseed_web_portal_project/",
+      "library_file_id": "libfile_abc57e44a36c8191be6f2bc24b287616",
+      "imported": 24,
+      "excluded": 9
+    },
+    {
+      "source": "mseed_web_smtp_larksuite_patch.zip",
+      "source_sha256": "3105509b94dd97b416575fe26b40311b753168d6567815d32296fc5b49da3320",
+      "destination": "archive/historical_patches/smtp_larksuite",
+      "strip_prefix": "",
+      "library_file_id": "libfile_953d4e5f1eb88191b1750277b6995d9a",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_portal_debug_20260705_172415.tar.gz",
+      "source_sha256": "c3b22d7a391dd43c399758eef38a1ca9a4035d2940ac2ca6e645033119d04256",
+      "destination": "archive/legacy_snapshots/portal_debug_20260705",
+      "strip_prefix": "mseed_portal_debug_20260705_172415/opt/mseed-web-portal/",
+      "library_file_id": "libfile_f22726a5bb9081918aced73d3a433dda",
+      "imported": 50,
+      "excluded": 1016
+    },
+    {
+      "source": "mseed_make_debug_package.sh",
+      "source_sha256": "bc2c0b987fc481c61e66395d84c4dcb9d8ec987b2134dff297aed86b544c941a",
+      "destination": "tools/diagnostics",
+      "strip_prefix": "",
+      "library_file_id": "libfile_33901183e03481919852559d63d4a3cf",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_device_autosync_bulk_access_patch.sh",
+      "source_sha256": "19121ce32fd158bf5bed479e65cb638bee8b4eb275df998144b991d1eedbd0a1",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_069d9d0c57c08191b53093bf26ac067f",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_export_i18n_stage3_patch.sh",
+      "source_sha256": "62d37d87a8db5a2a1cd9f00f192971fc900868cc3eb2168f767ef1ec59c463fe",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_d64ddda8dcf08191ad529813c67dfde3",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_fix_save_user_stage5_patch.sh",
+      "source_sha256": "fbe9b38925ea9613a73ae25f2373288fe3fb17c936c3375042bf7a94bf193031",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_4934420377088191a48b1c339e6d13ed",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_history_latest_slider_patch.sh",
+      "source_sha256": "0ab683a07937824e809441527cb02677ae24284863d033285d786457d66c56d3",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_1008e433b1a881918ebc528e97f15b04",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_i18n_cleanup_patch.sh",
+      "source_sha256": "b7643fd20f38b442bed37c9ccc20c8a78a432adc8c04b2debdafba8de7e58bec",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_c443ec02b520819199075a561c36364c",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_i18n_full_patch.sh",
+      "source_sha256": "1630fbb4b9fcb657335ccd92b78f020b4f7467bc556ff0ee8c2ec5351d8d7647",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_235fec77f4848191b94f19eff6b5c01c",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_language_switch_patch.sh",
+      "source_sha256": "b5da14d3b56db8f5dbc412d301304ae8956e5a942d29cab1ff97477ecf48d0c3",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_5fe6f1ac329c81918a9345af844c48b8",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_multichannel_history_patch.sh",
+      "source_sha256": "abf4f32d17d842b2ee65c595800d02a86fdae191566179001e2555191d4e9b99",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_86825994e5708191a9648cfbdb7f195f",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage10_1_history_title_textfix_patch.sh",
+      "source_sha256": "aa2082a2818510fbb2064fc5477a3fae6615e7894e4b70edc3d0f9fb192551fe",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_0de19e43885081919389884d5a97f312",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage10_i18n_admin_complete_patch.sh",
+      "source_sha256": "b04f815a61a736a4c9bb8fe85bb5e46bdc86f84c5bd1aa92f733d8753d5c3091",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_3600c86bf0108191beaa181a06d57cfd",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage1_product_patch.sh",
+      "source_sha256": "ab71fd2e62c966d61bbb701416ce5a43a9d6278c622f5195ee68b992ae133093",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_ac3b375c6bb0819198a7f5c0c5756ab6",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage2_alert_backup_patch.sh",
+      "source_sha256": "621d4b2129ad777a42b0c66d04a79b47adea25ef8675c3c5ec9445502c0bd13b",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_835733c0f61c819188a8985f73410d30",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage5_user_permissions_patch.sh",
+      "source_sha256": "bd4561e5fa91d98fdabb022483180ec78d60a8b69153fbe59fad27beb27de335",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_8caf20068ea08191a5be6f907ee65840",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage6_1_i18n_no_flash_cleanup_patch.sh",
+      "source_sha256": "860cd689e44914418d473e377ef1ca161e42611121103948f4dd7fe1f900bb4d",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_0975947b9238819181220b1e1e774ea9",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage6_2_final_i18n_cleanup_patch.sh",
+      "source_sha256": "4e7fcfb923c6cd03a78e43421222de9dc6a6c7f0cc7bd5f65cf2c4d946bb05bb",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_9b8619e04110819181c85dc81aeeb5cd",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage6_full_i18n_coverage_patch.sh",
+      "source_sha256": "b6550c03edc2cfd2b3c58ab7b5200aa37e2f80067ce211fd6141cf2169af0d8b",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_04a0a4e6ce28819195d5409ec47afc7f",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage7_safe_i18n_and_plot_fix_patch.sh",
+      "source_sha256": "461dcdf10d0add0c867e8a9677b4643e4c5f9e8cb3f0e4f4cd2521efd0adf020",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_a7852a172ef081918a6d5428f4f3310c",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage8_clean_i18n_plot_repair_patch.sh",
+      "source_sha256": "ede8a7f2752e9f3e0656799894f4735328bf6c5fb814c11d017ca1c42a739e3a",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_19cd34d6d48c819192aeef57f5b2b65f",
+      "imported": 1,
+      "excluded": 0
+    },
+    {
+      "source": "mseed_web_stage9_final_i18n_waveform_fix_patch.sh",
+      "source_sha256": "ca40c10e0deb94be73aca46918cd023bff8afd04b73fcd5f653c452636631edb",
+      "destination": "archive/historical_patches/web_portal",
+      "strip_prefix": "",
+      "library_file_id": "libfile_afb3fdfeb68881918af4a58f1d20a12c",
+      "imported": 1,
+      "excluded": 0
+    }
+  ]
+}

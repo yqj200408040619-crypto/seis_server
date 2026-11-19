@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-end mb-4 flex-wrap gap-3">
+  <div>
+    <div class="portal-pill mb-2">Data quality</div>
+    <h1 class="h3 fw-bold mb-1">数据质量</h1>
+    <p class="text-secondary mb-0">查看设备断流、重复包、异常包和三分量完整性。</p>
+  </div>
+</div>
+
+<div class="row g-4">
+{% for card in cards %}
+  {% set d = card.device %}
+  {% set s = card.summary %}
+  {% set q = card.quality %}
+  <div class="col-12 col-xl-6">
+    <div class="device-card h-100">
+      <div class="d-flex justify-content-between align-items-start mb-3">
+        <div>
+          <h2 class="h5 fw-bold mb-1">{{ d.alias or d.label }}</h2>
+          <div class="small text-secondary">{{ d.device_key }} · {{ d.site_name or '' }}</div>
+        </div>
+        <span class="status-pill status-{{ s.status }}">{{ s.status }}</span>
+      </div>
+      <div class="metric-grid mb-3">
+        <div><span>Gaps</span><strong>{{ q.gap_count }}</strong></div>
+        <div><span>Duplicates</span><strong>{{ q.duplicate_count }}</strong></div>
+        <div><span>Bad packets</span><strong>{{ q.bad_packet_count }}</strong></div>
+        <div><span>Last data</span><strong class="unix-time" data-unix="{{ s.last_start or '' }}">-</strong></div>
+      </div>
+      <div class="component-row mb-3">
+        {% for c in s.component_status %}
+        <span class="component-badge component-{{ c.status }}">{{ c.component }} <small>{{ c.status }}</small></span>
+        {% endfor %}
+        {% for m in s.missing_components %}
+        <span class="component-badge component-missing">{{ m }} <small>missing</small></span>
+        {% endfor %}
+      </div>
+      <details class="quality-details">
+        <summary>最近质量事件</summary>
+        <div class="table-responsive mt-3">
+          <table class="table table-dark table-sm align-middle">
+            <thead><tr><th>类别</th><th>详情</th></tr></thead>
+            <tbody>
+              {% for row in q.gaps[:8] %}<tr><td>gap</td><td><code>{{ row }}</code></td></tr>{% endfor %}
+              {% for row in q.duplicates[:8] %}<tr><td>duplicate</td><td><code>{{ row }}</code></td></tr>{% endfor %}
+              {% for row in q.bad_packets[:8] %}<tr><td>bad</td><td><code>{{ row }}</code></td></tr>{% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </div>
+  </div>
+{% endfor %}
+</div>
+<script src="/static/js/time.js"></script>
+{% endblock %}

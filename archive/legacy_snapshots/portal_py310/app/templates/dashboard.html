@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-end mb-4">
+  <div>
+    <div class="portal-pill mb-2">Overview</div>
+    <h1 class="h3 fw-bold mb-1">设备总览</h1>
+    <p class="text-secondary mb-0">展示当前账号可访问的仪器、三分量和最新入库时间。</p>
+  </div>
+  <div class="text-secondary small">刷新页面可更新统计</div>
+</div>
+
+{% if not cards %}
+<div class="empty-state">当前账号还没有分配设备。请联系管理员分配仪器权限。</div>
+{% endif %}
+
+<div class="row g-4">
+  {% for card in cards %}
+  {% set d = card.device %}
+  {% set s = card.summary %}
+  <div class="col-12 col-md-6 col-xl-4">
+    <div class="device-card h-100">
+      <div class="d-flex justify-content-between align-items-start mb-3">
+        <div>
+          <div class="text-secondary small">{{ d.instrument_type or 'DEV' }} / {{ d.instrument_serial or d.device_key }}</div>
+          <h2 class="h5 fw-bold mb-1">{{ d.label }}</h2>
+          <div class="small text-secondary">{{ d.client_ip or 'unknown IP' }} : {{ d.server_port or '-' }}</div>
+        </div>
+        <span class="status-dot"></span>
+      </div>
+      <div class="metric-grid mb-3">
+        <div><span>总包数</span><strong>{{ s.total_packets }}</strong></div>
+        <div><span>最新时间</span><strong class="unix-time" data-unix="{{ s.last_start or '' }}">-</strong></div>
+      </div>
+      <div class="component-row mb-4">
+        {% for c in s.components %}
+        <span class="component-badge">{{ c.component }} <small>{{ c.packets }}</small></span>
+        {% endfor %}
+      </div>
+      <div class="d-flex gap-2">
+        <a class="btn btn-sm btn-primary" href="/live?device_id={{ d.id }}">实时波形</a>
+        <a class="btn btn-sm btn-outline-light" href="/history?device_id={{ d.id }}">历史查询</a>
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+<script src="/static/js/time.js"></script>
+{% endblock %}

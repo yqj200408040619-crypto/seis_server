@@ -1,0 +1,27 @@
+[Unit]
+Description=miniSEED Web Portal for Customer Waveform Access
+After=network.target mseed-tcp-server.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=mseedweb
+Group=mseedweb
+SupplementaryGroups=mseed
+WorkingDirectory=/opt/mseed-web-portal
+Environment=MSEED_WEB_CONFIG=/etc/mseed-web-portal/portal.ini
+ExecStart=/opt/mseed-web-portal/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080 --workers 1
+Restart=always
+RestartSec=3
+TimeoutStopSec=20
+
+# Basic hardening. Keep filesystem readable; app writes only to its own state/log dirs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/mseed-web-portal /var/log/mseed-web-portal
+ReadOnlyPaths=/var/lib/mseed-tcp-server/devices
+
+[Install]
+WantedBy=multi-user.target

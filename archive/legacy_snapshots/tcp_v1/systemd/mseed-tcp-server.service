@@ -1,0 +1,21 @@
+[Unit]
+Description=miniSEED TCP Receiver for Seismic Instruments
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mseed
+Group=mseed
+WorkingDirectory=/opt/mseed-tcp-server
+ExecStart=/opt/mseed-tcp-server/.venv/bin/python -m mseed_tcp_server --config /etc/mseed-tcp-server/server.ini
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/mseed-tcp-server /var/log/mseed-tcp-server
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Sync miniSEED device database index and apply customer device rules
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/mseed-web-portal
+Environment=PYTHONPATH=/opt/mseed-web-portal
+Environment=MSEED_WEB_CONFIG=/etc/mseed-web-portal/portal.ini
+ExecStart=/opt/miniforge3/envs/mseed-web/bin/python /opt/mseed-web-portal/tools/sync_devices.py
+Nice=10
+IOSchedulingClass=idle
+CPUQuota=20%
+MemoryMax=200M

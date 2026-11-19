@@ -1,0 +1,19 @@
+{
+  "added_file_count": 185,
+  "python_syntax_checked": 59,
+  "python_syntax_errors": [],
+  "shell_syntax_checked": 32,
+  "shell_syntax_errors": [],
+  "credential_pattern_findings": [],
+  "preservation": {
+    "baseline_commit": "d923a220870a5aa2a694d531fc47d68ca33c81d9",
+    "original_files_verified": 76,
+    "imported_source_files_verified": 160,
+    "errors": [],
+    "passed": true
+  },
+  "source_archive_count": 28,
+  "scientific_calculations": "not_run",
+  "production_services": "not_changed",
+  "github_push": "not_performed_no_write_credentials"
+}

@@ -1,0 +1,44 @@
+[
+  {
+    "target": "deploy/reference_systemd/mseed-device-sync.service",
+    "sha256": "ff9b5378ede002f11ee2495ac93ad7bce54e440db71018212cd544a80cc1bedb",
+    "source": "mseed_web_device_autosync_bulk_access_patch.sh",
+    "source_sha256": "19121ce32fd158bf5bed479e65cb638bee8b4eb275df998144b991d1eedbd0a1",
+    "transformation": "literal systemd heredoc; substitute historical APP_DIR, CONFIG_DIR, PY; no execution"
+  },
+  {
+    "target": "deploy/reference_systemd/mseed-alert-worker.timer",
+    "sha256": "6273e8045107bef9a917ad8b41b4aeb200535a37571ad241e5223f7c58c7d719",
+    "source": "mseed_web_stage2_alert_backup_patch.sh",
+    "source_sha256": "621d4b2129ad777a42b0c66d04a79b47adea25ef8675c3c5ec9445502c0bd13b",
+    "transformation": "literal systemd heredoc; substitute historical APP_DIR, CONFIG_DIR, PY; no execution"
+  },
+  {
+    "target": "deploy/reference_systemd/mseed-backup.timer",
+    "sha256": "1043ba38e60bd3acd69aa1b24e846ad1bff822172a26e83da546d827460ba44d",
+    "source": "mseed_web_stage2_alert_backup_patch.sh",
+    "source_sha256": "621d4b2129ad777a42b0c66d04a79b47adea25ef8675c3c5ec9445502c0bd13b",
+    "transformation": "literal systemd heredoc; substitute historical APP_DIR, CONFIG_DIR, PY; no execution"
+  },
+  {
+    "target": "deploy/reference_systemd/mseed-alert-worker.service",
+    "sha256": "87dc1f7a610aa54990693db4505153221d9bbdadc4b2c89718c87576d30a243a",
+    "source": "mseed_web_stage2_alert_backup_patch.sh",
+    "source_sha256": "621d4b2129ad777a42b0c66d04a79b47adea25ef8675c3c5ec9445502c0bd13b",
+    "transformation": "literal systemd heredoc; substitute historical APP_DIR, CONFIG_DIR, PY; no execution"
+  },
+  {
+    "target": "deploy/reference_systemd/mseed-device-sync.timer",
+    "sha256": "6f1c6f421822c7f732fc5183a6f67a63e90dba588418c8ca0d5f1e6a7bcdc2c0",
+    "source": "mseed_web_device_autosync_bulk_access_patch.sh",
+    "source_sha256": "19121ce32fd158bf5bed479e65cb638bee8b4eb275df998144b991d1eedbd0a1",
+    "transformation": "literal systemd heredoc; substitute historical APP_DIR, CONFIG_DIR, PY; no execution"
+  },
+  {
+    "target": "deploy/reference_systemd/mseed-backup.service",
+    "sha256": "d1f4dc6c7050320629a7d7192b1d86723b46f6724cfec3acc1ce66bc094e4039",
+    "source": "mseed_web_stage2_alert_backup_patch.sh",
+    "source_sha256": "621d4b2129ad777a42b0c66d04a79b47adea25ef8675c3c5ec9445502c0bd13b",
+    "transformation": "literal systemd heredoc; substitute historical APP_DIR, CONFIG_DIR, PY; no execution"
+  }
+]

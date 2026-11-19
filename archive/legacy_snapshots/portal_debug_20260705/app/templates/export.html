@@ -1,0 +1,188 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="d-flex justify-content-between align-items-end mb-4 flex-wrap gap-3">
+  <div>
+    <div class="portal-pill mb-2">Data export</div>
+    <h1 class="h3 fw-bold mb-1">数据导出</h1>
+    <p class="text-secondary mb-0">按设备、客户、三分量和 UTC 时间范围导出原始 miniSEED 数据。数据有中断时，导出仍会包含已有数据，并在批量导出的 gaps.csv 中列出缺口。</p>
+  </div>
+</div>
+
+<div class="row g-4">
+  <div class="col-12 col-xl-6">
+    <div class="control-panel h-100">
+      <h2 class="h5 fw-bold mb-3">单台设备导出</h2>
+      <form id="singleExportForm" method="get" action="/export/download3" class="row g-3 align-items-end">
+        <div class="col-12">
+          <label class="form-label">设备</label>
+          <select id="deviceSelect" name="device_id" class="form-select">
+            {% for d in devices %}
+            <option value="{{ d.id }}" {% if selected_device_id and selected_device_id == d.id %}selected{% endif %}>{{ d.alias or d.label }} / {{ d.device_key }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-12 col-md-6">
+          <label class="form-label">开始时间 UTC</label>
+          <input id="startInput" name="start" class="form-control" placeholder="2026-06-30T15:30:00Z" required>
+        </div>
+        <div class="col-12 col-md-6">
+          <label class="form-label">结束时间 UTC</label>
+          <input id="endInput" name="end" class="form-control" placeholder="2026-06-30T15:35:00Z" required>
+        </div>
+        <div class="col-12">
+          <label class="form-label">分量</label>
+          <div id="exportComponentChecks" class="component-checks"></div>
+          <input type="hidden" id="componentsInput" name="components" value="">
+        </div>
+        <div class="col-12 d-flex flex-wrap gap-2">
+          <button type="button" id="latestBtn" class="btn btn-outline-light">跳到最新数据</button>
+          <button type="button" id="previewBtn" class="btn btn-outline-light">预览范围</button>
+          <button class="btn btn-primary">导出 miniSEED</button>
+        </div>
+      </form>
+      <div id="exportPreview" class="mt-4 text-secondary small"></div>
+    </div>
+  </div>
+
+  <div class="col-12 col-xl-6">
+    <div class="control-panel h-100">
+      <h2 class="h5 fw-bold mb-3">批量导出</h2>
+      <form id="batchExportForm" method="get" action="/export/batch3" class="row g-3 align-items-end">
+        <input type="hidden" id="batchStart" name="start" value="">
+        <input type="hidden" id="batchEnd" name="end" value="">
+        <input type="hidden" id="batchComponents" name="components" value="">
+        <input type="hidden" id="batchDeviceIds" name="device_ids" value="">
+        <div class="col-12 col-md-6">
+          <label class="form-label">客户过滤</label>
+          <select id="customerFilter" name="customer_id" class="form-select">
+            <option value="">全部可见设备</option>
+          </select>
+        </div>
+        <div class="col-12 col-md-6">
+          <label class="form-label">导出方式</label>
+          <select id="batchMode" name="all_visible" class="form-select">
+            <option value="0">导出勾选设备</option>
+            <option value="1">导出全部可见设备</option>
+          </select>
+        </div>
+        <div class="col-12">
+          <label class="form-label">设备列表</label>
+          <div id="batchDeviceList" class="batch-device-list"></div>
+        </div>
+        <div class="col-12 d-flex flex-wrap gap-2">
+          <button type="button" id="selectAllDevices" class="btn btn-outline-light">全选</button>
+          <button type="button" id="clearAllDevices" class="btn btn-outline-light">清空</button>
+          <button class="btn btn-primary">批量导出 ZIP</button>
+        </div>
+      </form>
+      <div class="mt-4 small text-secondary">
+        <p class="mb-2"><strong>说明：</strong>批量导出会生成 ZIP 文件，包含每台设备的 miniSEED 文件、manifest.csv 和 gaps.csv。</p>
+        <p class="mb-0">如果数据中断，导出不会失败；文件只包含实际存在的记录，缺口会保存在 gaps.csv 供后续检查。</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="device-card mt-4">
+  <h2 class="h6 fw-bold mb-2">导出行为说明</h2>
+  <ul class="text-secondary mb-0">
+    <li>导出的是数据库中保存的原始 raw_mseed 记录，不会重新采样或修改波形。</li>
+    <li>如果所选时间段没有记录，系统会显示友好提示，而不是直接返回 JSON 错误。</li>
+    <li>如果时间段内存在数据中断，miniSEED 文件仍然可用；ObsPy 等工具会识别为不连续数据段。</li>
+  </ul>
+</div>
+
+<style>
+.batch-device-list{max-height:260px;overflow:auto;border:1px solid rgba(148,163,184,.22);border-radius:14px;padding:12px;background:rgba(15,23,42,.35)}
+.batch-device-row{display:flex;align-items:center;gap:10px;padding:8px;border-bottom:1px solid rgba(148,163,184,.12)}
+.batch-device-row:last-child{border-bottom:0}.export-preview-table{width:100%;border-collapse:collapse}.export-preview-table td,.export-preview-table th{padding:6px 8px;border-bottom:1px solid rgba(148,163,184,.15)}
+</style>
+
+<script>
+const devicesFromServer = {{ devices|tojson }};
+function isoNoMs(d){ return d.toISOString().replace('.000Z','Z'); }
+async function fetchJSON(url){ const r = await fetch(url, {credentials:'same-origin'}); if(!r.ok) throw new Error(await r.text()); return await r.json(); }
+function selectedComponents(){ return Array.from(document.querySelectorAll('.export-comp:checked')).map(x=>x.value); }
+function updateComponentInputs(){ const v = selectedComponents().join(','); document.getElementById('componentsInput').value = v; document.getElementById('batchComponents').value = v; }
+async function loadLatestWindow(){
+  const id = document.getElementById('deviceSelect')?.value; if(!id) return;
+  try{
+    const j = await fetchJSON('/api/export/default-window3?device_id=' + encodeURIComponent(id) + '&minutes=30');
+    document.getElementById('startInput').value = j.start_iso;
+    document.getElementById('endInput').value = j.end_iso;
+    syncBatchTimes();
+  }catch(e){
+    const end = new Date(); const start = new Date(end.getTime()-30*60*1000);
+    document.getElementById('startInput').value = isoNoMs(start);
+    document.getElementById('endInput').value = isoNoMs(end);
+    syncBatchTimes();
+  }
+}
+async function loadExportComponents(){
+  const sel = document.getElementById('deviceSelect'); if(!sel || !sel.value) return;
+  const box = document.getElementById('exportComponentChecks'); box.innerHTML = '';
+  const p = await fetchJSON('/api/components?device_id=' + encodeURIComponent(sel.value));
+  const comps = (p.components || []).map(c=>c.component).sort((a,b)=>{
+    const order = {'BHZ':0,'BHN':1,'BHE':2,'EHZ':0,'EHN':1,'EHE':2}; return (order[a]??9)-(order[b]??9) || String(a).localeCompare(String(b));
+  });
+  comps.forEach((c, idx) => {
+    const lab = document.createElement('label'); lab.className = 'component-badge';
+    lab.innerHTML = `<input class="form-check-input mt-0 export-comp" type="checkbox" value="${c}" ${idx < 3 ? 'checked' : ''}> ${c}`;
+    box.appendChild(lab);
+  });
+  updateComponentInputs();
+}
+function syncBatchTimes(){ document.getElementById('batchStart').value = document.getElementById('startInput').value; document.getElementById('batchEnd').value = document.getElementById('endInput').value; }
+async function previewRange(){
+  updateComponentInputs(); syncBatchTimes();
+  const box = document.getElementById('exportPreview'); box.innerHTML = '加载中...';
+  const q = new URLSearchParams({device_id: document.getElementById('deviceSelect').value, components: document.getElementById('componentsInput').value, start: document.getElementById('startInput').value, end: document.getElementById('endInput').value});
+  try{
+    const j = await fetchJSON('/api/export/preview3?' + q.toString()); const p = j.preview;
+    if(!p.has_records){ box.innerHTML = '<div class="alert alert-warning">所选时间段没有记录。请点击“跳到最新数据”后重试，或检查历史波形中的最新时间。</div>'; return; }
+    let html = `<table class="export-preview-table"><thead><tr><th>分量</th><th>记录数</th><th>字节</th><th>首条时间</th><th>最后时间</th></tr></thead><tbody>`;
+    for(const c of p.components){ html += `<tr><td>${c.component}</td><td>${c.records}</td><td>${c.bytes}</td><td>${c.first_start_iso}</td><td>${c.last_start_iso}</td></tr>`; }
+    html += `</tbody></table><div class="mt-2">总记录数：${p.total_records}，数据缺口：${p.gap_count}</div>`;
+    if(p.gap_count > 0) html += '<div class="alert alert-warning mt-2">该时间段存在数据中断。导出不会失败，但文件中会缺少对应时间段的数据。</div>';
+    box.innerHTML = html;
+  }catch(e){ box.innerHTML = '<div class="alert alert-danger">预览失败：' + e.message + '</div>'; }
+}
+function uniqueCustomers(){
+  const m = new Map();
+  for(const d of devicesFromServer){ const cid = d.customer_id || ''; const name = d.customer_name || d.customer || (cid ? ('Customer ' + cid) : '未分组'); if(cid) m.set(String(cid), name); }
+  return Array.from(m.entries()).sort((a,b)=>a[1].localeCompare(b[1]));
+}
+function renderCustomerFilter(){
+  const sel = document.getElementById('customerFilter'); if(!sel) return;
+  for(const [id,name] of uniqueCustomers()){ const opt=document.createElement('option'); opt.value=id; opt.textContent=name; sel.appendChild(opt); }
+}
+function renderBatchDeviceList(){
+  const cid = document.getElementById('customerFilter').value;
+  const list = document.getElementById('batchDeviceList'); list.innerHTML = '';
+  const filtered = devicesFromServer.filter(d => !cid || String(d.customer_id || '') === cid);
+  for(const d of filtered){
+    const row=document.createElement('label'); row.className='batch-device-row';
+    row.innerHTML = `<input class="form-check-input batch-dev" type="checkbox" value="${d.id}" checked> <span><strong>${d.alias || d.label}</strong> <span class="text-secondary">${d.device_key || ''}</span></span>`;
+    list.appendChild(row);
+  }
+  updateBatchDeviceIds();
+}
+function updateBatchDeviceIds(){ document.getElementById('batchDeviceIds').value = Array.from(document.querySelectorAll('.batch-dev:checked')).map(x=>x.value).join(','); }
+document.addEventListener('DOMContentLoaded', async () => {
+  renderCustomerFilter(); renderBatchDeviceList();
+  await loadExportComponents().catch(console.error); await loadLatestWindow();
+  document.getElementById('deviceSelect')?.addEventListener('change', async () => { await loadExportComponents().catch(console.error); await loadLatestWindow(); });
+  document.getElementById('latestBtn')?.addEventListener('click', loadLatestWindow);
+  document.getElementById('previewBtn')?.addEventListener('click', previewRange);
+  document.getElementById('exportComponentChecks')?.addEventListener('change', updateComponentInputs);
+  document.getElementById('startInput')?.addEventListener('change', syncBatchTimes);
+  document.getElementById('endInput')?.addEventListener('change', syncBatchTimes);
+  document.getElementById('customerFilter')?.addEventListener('change', renderBatchDeviceList);
+  document.getElementById('batchDeviceList')?.addEventListener('change', updateBatchDeviceIds);
+  document.getElementById('selectAllDevices')?.addEventListener('click',()=>{document.querySelectorAll('.batch-dev').forEach(x=>x.checked=true);updateBatchDeviceIds();});
+  document.getElementById('clearAllDevices')?.addEventListener('click',()=>{document.querySelectorAll('.batch-dev').forEach(x=>x.checked=false);updateBatchDeviceIds();});
+  document.getElementById('singleExportForm')?.addEventListener('submit',()=>{updateComponentInputs();syncBatchTimes();});
+  document.getElementById('batchExportForm')?.addEventListener('submit',()=>{updateComponentInputs();syncBatchTimes();updateBatchDeviceIds();});
+});
+</script>
+{% endblock %}

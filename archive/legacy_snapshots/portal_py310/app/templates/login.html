@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="login-shell">
+  <div class="login-card shadow-lg">
+    <div class="mb-4">
+      <div class="portal-pill mb-3">miniSEED Receiver</div>
+      <h1 class="h3 fw-bold mb-2">客户数据访问平台</h1>
+      <p class="text-secondary mb-0">登录后查看授权地震仪的实时与历史波形。</p>
+    </div>
+    {% if error %}
+    <div class="alert alert-danger py-2">{{ error }}</div>
+    {% endif %}
+    <form method="post" action="/login">
+      <div class="mb-3">
+        <label class="form-label">账号</label>
+        <input class="form-control form-control-lg" name="username" autocomplete="username" required>
+      </div>
+      <div class="mb-4">
+        <label class="form-label">密码</label>
+        <input class="form-control form-control-lg" type="password" name="password" autocomplete="current-password" required>
+      </div>
+      <button class="btn btn-primary btn-lg w-100">登录</button>
+    </form>
+  </div>
+</div>
+{% endblock %}

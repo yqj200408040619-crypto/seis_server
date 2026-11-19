@@ -1,0 +1,16 @@
+[Unit]
+Description=miniSEED Web Portal Database Backup
+After=network.target mseed-tcp-server.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/mseed-web-portal
+Environment=MSEED_WEB_CONFIG=/etc/mseed-web-portal/portal.ini
+ExecStart=/opt/miniforge3/envs/mseed-web/bin/python /opt/mseed-web-portal/tools/backup_databases.py
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUQuota=50%
+MemoryMax=600M
