@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import queue
+import signal
 import socket
 import socketserver
 import threading
@@ -117,24 +118,67 @@ class MSeedWritePipeline:
                 work_queue.task_done()
 
     def close(self, drain_timeout_sec: float = 30.0) -> None:
+        """Stop accepting work and shut the writers down WITHOUT leaving any
+        HDF5 file mid-write.
+
+        Two phases, each with its own budget:
+
+        1. Best-effort drain: wait up to ``drain_timeout_sec`` for the already
+           queued packets to be persisted. A large backlog may not fully drain;
+           that is acceptable (those packets are lost on shutdown) — what is
+           NOT acceptable is abandoning a worker mid-write, which leaves the
+           device HDF5 file with its consistency flag set ("already open for
+           write") so the portal cannot read it until h5clear.
+
+        2. Guaranteed clean stop: ALWAYS send each worker its None sentinel and
+           ALWAYS give it a bounded grace period to return. Because a worker
+           only holds an h5py handle for the duration of a single insert_packet
+           (append-open then close), once it has consumed the sentinel and
+           returned, no file is left open. This phase must NOT be gated by the
+           drain deadline (the previous implementation gated marker delivery on
+           the expired deadline, so under a real backlog the workers never got
+           their sentinel and were left running mid-write — the exact cause of
+           locked files observed in the canary run).
+        """
         self.stopping.set()
-        deadline = time.monotonic() + drain_timeout_sec
+
+        # Phase 1: best-effort drain of queued work.
+        drain_deadline = time.monotonic() + max(0.0, drain_timeout_sec)
         for work_queue in self.queues:
-            while work_queue.unfinished_tasks and time.monotonic() < deadline:
+            while work_queue.unfinished_tasks and time.monotonic() < drain_deadline:
                 time.sleep(0.05)
             if work_queue.unfinished_tasks:
-                LOG.warning("miniSEED shutdown drain timeout; %d queued packets remain", work_queue.qsize())
+                LOG.warning("miniSEED shutdown drain timeout; %d queued packets remain (will stop workers cleanly)",
+                            work_queue.qsize())
+
+        # Phase 2: ALWAYS deliver the sentinel and let each worker finish its
+        # current write and exit. Budget is independent of the drain deadline.
+        stop_deadline = time.monotonic() + 10.0
         for index, work_queue in enumerate(self.queues):
-            while time.monotonic() < deadline:
+            delivered = False
+            while time.monotonic() < stop_deadline:
                 try:
-                    work_queue.put(None, timeout=0.1)
+                    work_queue.put(None, timeout=0.2)
+                    delivered = True
                     break
                 except queue.Full:
-                    pass
-            else:
+                    # Queue still full of backlog we won't drain; make room so
+                    # the sentinel can be delivered and the worker can exit.
+                    try:
+                        work_queue.get_nowait()
+                        work_queue.task_done()
+                    except queue.Empty:
+                        pass
+            if not delivered:
                 LOG.warning("miniSEED worker %d could not be sent its shutdown marker", index)
+
         for worker in self.workers:
-            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+            worker.join(timeout=10.0)
+            if worker.is_alive():
+                LOG.warning("miniSEED worker %s did not exit within grace period", worker.name)
+
+        # Closes any handle still cached (normally none, since writes use
+        # append-open-then-close); safe to call unconditionally.
         self.db_manager.close()
 
 
@@ -210,7 +254,10 @@ class MSeedRequestHandler(socketserver.BaseRequestHandler):
     def handle(self) -> None:
         cfg = self.server.config
         buffer = b""
-        last_data_unix = time.time()
+        now0 = time.time()
+        last_data_unix = now0        # last time ANY bytes arrived (for logging)
+        # last time a COMPLETE record was parsed; _process_buffer refreshes it.
+        self.last_record_unix = now0
 
         while True:
             try:
@@ -222,14 +269,29 @@ class MSeedRequestHandler(socketserver.BaseRequestHandler):
                 # a FIN/RST). Reap it so the semaphore slot is freed and the
                 # instrument can establish a fresh, data-carrying session; leaving
                 # it open would loop here forever and keep real-time data stalled.
+                now = time.time()
                 idle = cfg.server.idle_timeout_sec
-                if idle and (time.time() - last_data_unix) >= idle:
+                if idle and (now - last_data_unix) >= idle:
                     LOG.warning(
                         "idle timeout: no data from %s:%s for %.0fs; closing half-open connection",
-                        self.client_ip, self.client_port, time.time() - last_data_unix,
+                        self.client_ip, self.client_port, now - last_data_unix,
                     )
                     if buffer:
                         self._quarantine(buffer, "idle_timeout_partial_buffer")
+                    break
+                # Slow-trickle guard: a peer may dribble bytes often enough to
+                # keep last_data_unix fresh yet never deliver a full record.
+                # Close it once it has produced no complete record for
+                # idle_no_record_sec, so it stops holding a slot for nothing.
+                no_rec = cfg.server.idle_no_record_sec
+                if no_rec and (now - self.last_record_unix) >= no_rec:
+                    LOG.warning(
+                        "no-record timeout: no complete record from %s:%s for %.0fs "
+                        "(received %d bytes); closing slow/stuck connection",
+                        self.client_ip, self.client_port, now - self.last_record_unix, self.byte_count,
+                    )
+                    if buffer:
+                        self._quarantine(buffer, "no_record_timeout_partial_buffer")
                     break
                 continue
             except ConnectionResetError:
@@ -329,6 +391,8 @@ class MSeedRequestHandler(socketserver.BaseRequestHandler):
                 LOG.warning("miniSEED receiver is stopping; discarded unfinished input peer=%s:%s", self.client_ip, self.client_port)
                 return buffer
             self.packet_count += 1
+            # Refresh the no-record idle clock: a complete record was produced.
+            self.last_record_unix = time.time()
 
         return buffer
 
@@ -339,11 +403,37 @@ class MSeedRequestHandler(socketserver.BaseRequestHandler):
 def run_server(config: AppConfig) -> None:
     db_manager = DeviceDatabaseManager(config)
     address = (config.server.host, config.server.port)
-    
+
     # Outer try ensures logging is performed even if SystemExit is raised inside the with block
     try:
         with MSeedTCPServer(address, MSeedRequestHandler, config, db_manager) as srv:
             LOG.info("mseed TCP server listening on %s:%s", config.server.host, config.server.port)
+
+            # Translate SIGTERM (what `systemctl stop` and subprocess.terminate()
+            # send) into a clean serve_forever() shutdown. Without this, SIGTERM
+            # kills the process instantly, mid-write, so the bounded write queue
+            # is never drained and the in-flight h5py append handle is never
+            # closed — leaving the device HDF5 file with its consistency flag set
+            # ("already open for write") until an operator runs h5clear. The
+            # production systemd unit is Type=simple with the default
+            # KillSignal=SIGTERM, so this affected every normal restart.
+            #
+            # BaseServer.shutdown() must be called from a DIFFERENT thread than
+            # the one running serve_forever(), so the handler spawns a tiny
+            # thread to request the stop. serve_forever() then returns normally,
+            # the `with` block exits and server_close() drains the queue and
+            # closes all HDF5 handles.
+            def _on_sigterm(signum, frame):
+                LOG.info("Received SIGTERM, initiating graceful shutdown...")
+                threading.Thread(target=srv.shutdown, name="sigterm-shutdown",
+                                 daemon=True).start()
+            try:
+                signal.signal(signal.SIGTERM, _on_sigterm)
+            except (ValueError, OSError):
+                # signal.signal only works in the main thread; if run_server is
+                # ever invoked off-thread, fall back to prior behaviour.
+                LOG.warning("could not install SIGTERM handler (not main thread?)")
+
             try:
                 srv.serve_forever(poll_interval=0.5)
             except (KeyboardInterrupt, SystemExit):

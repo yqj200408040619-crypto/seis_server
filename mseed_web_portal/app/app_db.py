@@ -54,9 +54,18 @@ CREATE INDEX IF NOT EXISTS idx_user_devices_user ON user_devices(user_id);
 
 def connect(app_db_path: str) -> sqlite3.Connection:
     os.makedirs(os.path.dirname(app_db_path), exist_ok=True)
-    conn = sqlite3.connect(app_db_path)
+    # Use an explicit busy timeout instead of relying on Python's implicit 5s
+    # default, and align it with stage2.app_connect()'s timeout=20. app.db is
+    # written by both the web routes (via this function) and the alert worker
+    # (via stage2). When a writer holds the WAL lock for more than the implicit
+    # 5s, the web path used to fail immediately with "database is locked" while
+    # the alert worker (timeout=20) succeeded. Setting the same 20s window on
+    # both connection factories removes that inconsistency; PRAGMA busy_timeout
+    # makes the intent explicit regardless of the driver default.
+    conn = sqlite3.connect(app_db_path, timeout=20)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=20000")
     return conn
 
 

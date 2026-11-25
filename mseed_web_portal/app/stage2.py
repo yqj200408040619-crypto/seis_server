@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import configparser
+import gzip
 import hashlib
 import os
+import shutil
 import smtplib
 import sqlite3
 import subprocess
@@ -332,6 +334,63 @@ def check_devices_once(app_db_path: str, receiver_db_dir: str, devices: list[sql
     return {"created": created, "updated": updated, "resolved": resolved, "emailed": emailed, "errors": errors, "checked": len(devices)}
 
 
+def backup_sqlite_database(src_path: str, dst_gz_path: str, compress_level: int = 6) -> int:
+    # Restored 2026-10-30: these four backup helpers were dropped from this
+    # module during the July SMTP change, but tools/backup_databases.py still
+    # calls them, so every nightly backup since Aug 13 failed. Code is
+    # unchanged from stage2.py.bak_smtp_20260701_171745.
+    os.makedirs(os.path.dirname(dst_gz_path), exist_ok=True)
+    tmp_db = dst_gz_path + ".tmp.db"
+    tmp_gz = dst_gz_path + ".tmp"
+    if os.path.exists(tmp_db):
+        os.unlink(tmp_db)
+    src = sqlite3.connect(f"file:{src_path}?mode=ro", uri=True, timeout=30)
+    try:
+        dst = sqlite3.connect(tmp_db, timeout=30)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    with open(tmp_db, "rb") as f_in, gzip.open(tmp_gz, "wb", compresslevel=compress_level) as f_out:
+        shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+    os.replace(tmp_gz, dst_gz_path)
+    os.unlink(tmp_db)
+    return os.path.getsize(dst_gz_path)
+
+
+def record_backup_run(app_db_path: str, *, status: str, started_at: float, message: str, backup_dir: str, files_count: int, total_bytes: int) -> None:
+    init_stage2(app_db_path)
+    with app_connect(app_db_path) as conn:
+        conn.execute(
+            "INSERT INTO backup_runs (started_at, finished_at, status, message, backup_dir, files_count, total_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (started_at, time.time(), status, message, backup_dir, files_count, total_bytes),
+        )
+        conn.commit()
+
+
+def list_backup_runs(app_db_path: str, limit: int = 20) -> list[dict[str, Any]]:
+    init_stage2(app_db_path)
+    with app_connect(app_db_path) as conn:
+        return [dict(r) for r in conn.execute("SELECT * FROM backup_runs ORDER BY started_at DESC LIMIT ?", (limit,)).fetchall()]
+
+
+def cleanup_old_backups(backup_dir: str, retention_days: int) -> int:
+    cutoff = time.time() - retention_days * 86400
+    removed = 0
+    root = Path(backup_dir)
+    if not root.exists():
+        return 0
+    for p in root.rglob("*.gz"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink(); removed += 1
+        except Exception:
+            pass
+    return removed
+
+
 def system_status(app_db_path: str, receiver_db_dir: str) -> dict[str, Any]:
     def service(name: str) -> str:
         try:
@@ -366,4 +425,5 @@ def system_status(app_db_path: str, receiver_db_dir: str) -> dict[str, Any]:
             "receiver_db_dir": dir_size(receiver_db_dir),
             "app_db": os.path.getsize(app_db_path) if os.path.exists(app_db_path) else 0,
         },
+        "backup_runs": list_backup_runs(app_db_path, limit=10),
     }

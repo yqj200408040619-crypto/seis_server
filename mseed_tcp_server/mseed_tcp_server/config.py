@@ -19,6 +19,15 @@ class ServerConfig:
     # blocking fresh data. idle_timeout_sec closes a connection after this
     # many seconds with zero received bytes (0 disables reaping).
     idle_timeout_sec: int = 300
+    # idle_timeout_sec reaps a connection that receives ZERO bytes. That misses
+    # a "slow trickle" peer that sends a byte every <socket_timeout_sec but never
+    # a full record: any byte refreshes the byte-idle clock so it is never
+    # reaped, yet it occupies a handler thread and a semaphore slot while
+    # delivering no data. idle_no_record_sec closes a connection that has not
+    # produced a COMPLETE parsed record within this many seconds, regardless of
+    # trickled bytes. Give legitimate low-rate instruments ample margin. 0
+    # disables this check. Should be >= idle_timeout_sec.
+    idle_no_record_sec: int = 600
     tcp_keepalive: bool = True
     # 100+ instruments commonly keep long-lived TCP sessions. Leave capacity
     # for reconnect storms without accepting an unbounded number of handlers.
@@ -40,6 +49,15 @@ class StorageConfig:
     hdf5_compression: str = "gzip"
     hdf5_compression_opts: int = 6
     hdf5_chunk_size: int = 1024 * 1024
+    # ---- In-memory cache bounds (prevents unbounded growth on long runs) ----
+    # Per-stream sha256 dedup cache is an LRU: it only needs to recognise the
+    # recent retransmits that follow a receiver restart, not the stream's entire
+    # history. Older entries are evicted. 0 disables the bound (legacy behaviour).
+    sha256_cache_max_per_stream: int = 20000
+    # When a device-file has had no writes for this many seconds, its in-memory
+    # lock / sha cache / seeded markers are pruned so memory does not grow with
+    # the number of devices ever seen. 0 disables pruning.
+    device_cache_ttl_sec: int = 86400
 
 
 @dataclass(frozen=True)
@@ -97,6 +115,7 @@ def load_config(path: str | Path | None) -> AppConfig:
         recv_size=_get_int(cp, "server", "recv_size", ServerConfig.recv_size),
         socket_timeout_sec=_get_int(cp, "server", "socket_timeout_sec", ServerConfig.socket_timeout_sec),
         idle_timeout_sec=_get_int(cp, "server", "idle_timeout_sec", ServerConfig.idle_timeout_sec),
+        idle_no_record_sec=_get_int(cp, "server", "idle_no_record_sec", ServerConfig.idle_no_record_sec),
         tcp_keepalive=_get_bool(cp, "server", "tcp_keepalive", ServerConfig.tcp_keepalive),
         max_clients=_get_int(cp, "server", "max_clients", ServerConfig.max_clients),
         writer_threads=_get_int(cp, "server", "writer_threads", ServerConfig.writer_threads),
@@ -113,6 +132,8 @@ def load_config(path: str | Path | None) -> AppConfig:
         hdf5_compression=_get_str(cp, "storage", "hdf5_compression", StorageConfig.hdf5_compression),
         hdf5_compression_opts=_get_int(cp, "storage", "hdf5_compression_opts", StorageConfig.hdf5_compression_opts),
         hdf5_chunk_size=_get_int(cp, "storage", "hdf5_chunk_size", StorageConfig.hdf5_chunk_size),
+        sha256_cache_max_per_stream=_get_int(cp, "storage", "sha256_cache_max_per_stream", StorageConfig.sha256_cache_max_per_stream),
+        device_cache_ttl_sec=_get_int(cp, "storage", "device_cache_ttl_sec", StorageConfig.device_cache_ttl_sec),
     )
 
     parser = ParserConfig(

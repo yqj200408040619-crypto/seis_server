@@ -21,7 +21,9 @@ def main() -> int:
     app_db.init_db(settings.app_db)
     stage2.init_stage2(settings.app_db)
     devices = app_db.list_devices(settings.app_db, admin=True)
-    result = stage2.check_devices_once(settings.app_db, settings.receiver_db_dir, devices, send_email=not args.no_email)
+    # Keep alert detection and persistence active, but never send automatic
+    # email from the scheduled worker.
+    result = stage2.check_devices_once(settings.app_db, settings.receiver_db_dir, devices, send_email=False)
     print(result)
     return 1 if result.get("errors") else 0
 
